@@ -1,5 +1,6 @@
 from openai import OpenAI as OpenAIClient
 from supabase import create_client, Client
+from flask_sock import Sock
 from config import Config
 
 def init_openai(app):
@@ -15,3 +16,8 @@ def init_supabase(app):
     else:
         app.supabase_client = None
         print("⚠️  Supabase not configured - conversation storage disabled")
+
+def init_websocket(app):
+    """Initialize WebSocket support for ConversationRelay"""
+    app.sock = Sock(app)
+    print("✅ WebSocket support initialized for ConversationRelay")

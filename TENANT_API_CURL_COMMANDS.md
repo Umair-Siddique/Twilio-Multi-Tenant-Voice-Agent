@@ -154,6 +154,45 @@ curl -X PUT http://localhost:5001/tenant/agent-config \
   }'
 ```
 
+### Update Custom Prompts
+```bash
+curl -X PUT http://localhost:5001/tenant/agent-config \
+  -H "Authorization: Bearer YOUR_ACCESS_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "custom_prompts": {
+      "system_prompt": "You are a helpful customer service assistant for Acme Healthcare. Be professional, empathetic, and solution-oriented. Always confirm important details before proceeding."
+    }
+  }'
+```
+
+### Update Escalation Rules
+```bash
+curl -X PUT http://localhost:5001/tenant/agent-config \
+  -H "Authorization: Bearer YOUR_ACCESS_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "escalation_rules": {
+      "urgent_keywords": ["emergency", "urgent", "critical", "immediate"],
+      "transfer_to_human": true,
+      "after_hours_action": "voicemail",
+      "max_attempts": 3
+    }
+  }'
+```
+
+### Update Storage Settings
+```bash
+curl -X PUT http://localhost:5001/tenant/agent-config \
+  -H "Authorization: Bearer YOUR_ACCESS_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "store_transcripts": true,
+    "store_recordings": false,
+    "retention_days": 90
+  }'
+```
+
 ### Complete Agent Configuration Update
 ```bash
 curl -X PUT http://localhost:5001/tenant/agent-config \
@@ -296,6 +335,30 @@ curl -X POST http://localhost:5001/auth/signout \
 
 ---
 
+## Step 11: Health Check Endpoints
+
+### Auth Service Health Check
+```bash
+curl -X GET http://localhost:5001/auth/health \
+  -H "Content-Type: application/json"
+```
+
+### Tenant Service Health Check
+```bash
+curl -X GET http://localhost:5001/tenant/health \
+  -H "Content-Type: application/json"
+```
+
+### Voice Agent Service Health Check
+```bash
+curl -X GET http://localhost:5001/voice-agent/health \
+  -H "Content-Type: application/json"
+```
+
+**Note:** Health check endpoints do not require authentication.
+
+---
+
 ## Quick Test Script (Bash)
 
 Save this as `quick_test.sh` and run it:
@@ -429,6 +492,10 @@ curl -X GET "${BASE_URL}/tenant/profile" \
 ### "Tenant not found"
 - Verify you're using the correct token
 - Token should be from a user who belongs to a tenant
+
+
+
+
 
 
 
