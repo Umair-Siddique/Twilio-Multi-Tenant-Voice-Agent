@@ -190,6 +190,14 @@ CREATE TABLE email_logs (
     created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
+-- 13. PASSWORD RESET TOKENS TABLE
+CREATE TABLE password_reset_tokens (
+    token TEXT PRIMARY KEY,
+    email TEXT NOT NULL,
+    expires_at TIMESTAMPTZ NOT NULL,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
 
 -- =====================================================
 -- PHASE 2: CREATE ALL INDEXES
@@ -245,6 +253,10 @@ CREATE INDEX idx_email_logs_tenant ON email_logs(tenant_id);
 CREATE INDEX idx_email_logs_call ON email_logs(call_id);
 CREATE INDEX idx_email_logs_status ON email_logs(tenant_id, status);
 
+-- Password reset tokens indexes
+CREATE INDEX idx_password_reset_tokens_expires_at ON password_reset_tokens(expires_at);
+CREATE INDEX idx_password_reset_tokens_email ON password_reset_tokens(email);
+
 
 -- =====================================================
 -- PHASE 3: ENABLE ROW LEVEL SECURITY ON ALL TABLES
@@ -262,6 +274,7 @@ ALTER TABLE integrations ENABLE ROW LEVEL SECURITY;
 ALTER TABLE integration_credentials ENABLE ROW LEVEL SECURITY;
 ALTER TABLE booking_requests ENABLE ROW LEVEL SECURITY;
 ALTER TABLE email_logs ENABLE ROW LEVEL SECURITY;
+ALTER TABLE password_reset_tokens ENABLE ROW LEVEL SECURITY;
 
 
 -- =====================================================

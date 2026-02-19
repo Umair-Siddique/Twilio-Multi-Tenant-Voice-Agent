@@ -19,3 +19,6 @@ class Config:
     CONVERSATION_LANGUAGE = os.getenv("CONVERSATION_LANGUAGE")
 
     OPENAI_MODEL = os.getenv("OPENAI_MODEL")
+
+    ADMIN_EMAIL = os.getenv("ADMIN_EMAIL")
+    ADMIN_APP_PASSWORD = os.getenv("ADMIN_APP_PASSWORD")

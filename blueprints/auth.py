@@ -1,6 +1,13 @@
 from flask import Blueprint, request, jsonify, current_app
 from functools import wraps
+import os
+import smtplib
 import traceback
+import secrets
+from datetime import datetime, timedelta
+from email.message import EmailMessage
+
+from config import Config
 
 auth_bp = Blueprint('auth', __name__)
 
@@ -15,6 +22,56 @@ def handle_errors(f):
             traceback.print_exc()
             return jsonify({"error": str(e)}), 500
     return decorated_function
+
+
+def _extract_action_link(generate_link_response):
+    """Extract recovery action link from different Supabase client response shapes."""
+    if generate_link_response is None:
+        return None
+
+    if isinstance(generate_link_response, dict):
+        if generate_link_response.get("action_link"):
+            return generate_link_response.get("action_link")
+        if isinstance(generate_link_response.get("properties"), dict):
+            return generate_link_response["properties"].get("action_link")
+
+    if hasattr(generate_link_response, "action_link"):
+        return getattr(generate_link_response, "action_link")
+
+    properties = getattr(generate_link_response, "properties", None)
+    if isinstance(properties, dict):
+        return properties.get("action_link")
+    if properties is not None and hasattr(properties, "action_link"):
+        return getattr(properties, "action_link")
+
+    return None
+
+
+def _send_reset_email_via_smtp(email_to, reset_link):
+    """Send password reset email using SMTP instead of Supabase email service."""
+    smtp_user = Config.ADMIN_EMAIL
+    smtp_password = Config.ADMIN_APP_PASSWORD
+    smtp_host = os.getenv("SMTP_HOST", "smtp.gmail.com")
+    smtp_port = int(os.getenv("SMTP_PORT", "587"))
+    from_email = os.getenv("SMTP_FROM_EMAIL", smtp_user or "")
+
+    if not smtp_user or not smtp_password:
+        raise ValueError("SMTP credentials not configured (ADMIN_EMAIL / ADMIN_APP_PASSWORD)")
+
+    msg = EmailMessage()
+    msg["Subject"] = "Reset your password"
+    msg["From"] = from_email
+    msg["To"] = email_to
+    msg.set_content(
+        "We received a request to reset your password.\n\n"
+        f"Reset your password using this link:\n{reset_link}\n\n"
+        "If you did not request this, you can ignore this email."
+    )
+
+    with smtplib.SMTP(smtp_host, smtp_port) as server:
+        server.starttls()
+        server.login(smtp_user, smtp_password)
+        server.send_message(msg)
 
 
 @auth_bp.route('/signup', methods=['POST'])
@@ -350,6 +407,280 @@ def refresh_token():
         
     except Exception as e:
         return jsonify({"error": f"Token refresh failed: {str(e)}"}), 401
+
+
+@auth_bp.route('/forgot-password', methods=['POST'])
+@handle_errors
+def forgot_password():
+    """
+    Send password reset email using SMTP (not Supabase email sending)
+
+    Request body:
+    {
+        "email": "user@company.com",
+        "redirect_to": "https://your-frontend.com/reset-password"  # optional
+    }
+    """
+    data = request.get_json() or {}
+    email = data.get('email')
+
+    if not email:
+        return jsonify({"error": "Email is required"}), 400
+
+    email = email.lower().strip()
+
+    supabase = current_app.supabase_client
+
+    if not supabase:
+        return jsonify({"error": "Supabase not configured"}), 500
+
+    try:
+        # Verify user exists (don't reveal if email exists or not in response)
+        users_response = supabase.auth.admin.list_users()
+        users_list = users_response if isinstance(users_response, list) else getattr(users_response, 'users', [])
+        
+        user_exists = False
+        for user in users_list:
+            user_email = getattr(user, 'email', None) if hasattr(user, 'email') else user.get('email') if isinstance(user, dict) else None
+            if user_email and user_email.lower() == email:
+                user_exists = True
+                break
+        
+        if user_exists:
+            # Generate secure token
+            reset_token = secrets.token_urlsafe(32)
+            expires_at = datetime.utcnow() + timedelta(hours=1)  # Token valid for 1 hour
+            
+            # Store token in Supabase
+            try:
+                supabase.table('password_reset_tokens').insert({
+                    "token": reset_token,
+                    "email": email,
+                    "expires_at": expires_at.isoformat()
+                }).execute()
+                
+                print(f"[DEBUG forgot_password] Token stored in Supabase for {email}, expires at {expires_at}")
+            except Exception as token_error:
+                print(f"[ERROR forgot_password] Failed to store token: {str(token_error)}")
+                raise
+            
+            # Clean up expired tokens
+            _cleanup_expired_tokens(supabase)
+            
+            # Build reset link
+            redirect_to = data.get('redirect_to') or os.getenv("PASSWORD_RESET_REDIRECT_URL", "http://localhost:3000/reset-password")
+            reset_link = f"{redirect_to}?token={reset_token}&email={email}"
+            
+            # Send email
+            _send_reset_email_via_smtp(email_to=email, reset_link=reset_link)
+            
+            print(f"[DEBUG forgot_password] Generated token for {email}, expires at {expires_at}")
+
+        # Always return success message (don't reveal if email exists)
+        return jsonify({
+            "message": "If the email exists, a password reset link has been sent."
+        }), 200
+
+    except Exception as e:
+        error_msg = str(e).lower()
+        if "authentication failed" in error_msg or "username and password not accepted" in error_msg:
+            return jsonify({
+                "error": "SMTP authentication failed",
+                "message": "Check ADMIN_EMAIL and ADMIN_APP_PASSWORD values."
+            }), 500
+        return jsonify({"error": f"Failed to send reset email: {str(e)}"}), 400
+
+
+def _cleanup_expired_tokens(supabase):
+    """Remove expired tokens from Supabase"""
+    try:
+        now = datetime.utcnow().isoformat()
+        result = supabase.table('password_reset_tokens').delete().lt('expires_at', now).execute()
+        if result.data:
+            print(f"[DEBUG] Cleaned up {len(result.data)} expired tokens")
+    except Exception as e:
+        print(f"[WARNING] Failed to cleanup expired tokens: {str(e)}")
+
+
+@auth_bp.route('/reset-password', methods=['POST'])
+@handle_errors
+def reset_password():
+    """
+    Reset user password after receiving the reset email link.
+
+    Use either:
+    - Authorization: Bearer <access_token_from_reset_link>
+    OR
+    - request body field "access_token"
+    OR
+    - request body with "token" (from email link) + "email" (user's email)
+
+    Request body:
+    {
+        "new_password": "new_secure_password",
+        "access_token": "optional_if_not_using_authorization_header",
+        "token": "optional_recovery_token_from_email_link",
+        "email": "required_when_using_token"
+    }
+    """
+    data = request.get_json() or {}
+    new_password = data.get('new_password')
+
+    if not new_password:
+        return jsonify({"error": "New password is required"}), 400
+
+    if len(new_password) < 6:
+        return jsonify({
+            "error": "Password too weak",
+            "message": "Password must be at least 6 characters long."
+        }), 400
+
+    auth_header = request.headers.get('Authorization')
+    token = None
+
+    if auth_header and auth_header.startswith('Bearer '):
+        token = auth_header.split(' ')[1]
+    else:
+        token = data.get('access_token')
+
+    supabase = current_app.supabase_client
+
+    if not supabase:
+        return jsonify({"error": "Supabase not configured"}), 500
+
+    recovery_token = data.get("token")
+    recovery_email = data.get("email")
+
+    try:
+        print(f"[DEBUG reset_password] Received: token={bool(token)}, recovery_token={bool(recovery_token)}, recovery_email={recovery_email}")
+        
+        user_id = None
+
+        # Method 1: Use access_token directly
+        if token:
+            print(f"[DEBUG reset_password] Method 1: Verifying access_token with get_user")
+            user_response = supabase.auth.get_user(token)
+            if user_response.user:
+                user_id = user_response.user.id
+                print(f"[DEBUG reset_password] get_user successful, user_id={user_id}")
+
+        # Method 2: Use recovery token + email (with proper token verification)
+        elif recovery_token and recovery_email:
+            print(f"[DEBUG reset_password] Method 2: Verifying recovery token")
+            
+            # Normalize email to lowercase
+            recovery_email = recovery_email.lower().strip()
+            print(f"[DEBUG reset_password] Normalized email: {recovery_email}")
+            
+            # Verify token exists in Supabase
+            try:
+                token_response = supabase.table('password_reset_tokens').select('*').eq('token', recovery_token).execute()
+                
+                if not token_response.data or len(token_response.data) == 0:
+                    print(f"[ERROR reset_password] Token not found in Supabase")
+                    return jsonify({"error": "Invalid or expired token"}), 401
+                
+                token_data = token_response.data[0]
+                
+                # Check if token expired
+                token_expires_at = datetime.fromisoformat(token_data["expires_at"].replace('Z', '+00:00'))
+                if datetime.utcnow().replace(tzinfo=token_expires_at.tzinfo) > token_expires_at:
+                    print(f"[ERROR reset_password] Token expired at {token_expires_at}")
+                    # Delete expired token
+                    supabase.table('password_reset_tokens').delete().eq('token', recovery_token).execute()
+                    return jsonify({"error": "Invalid or expired token"}), 401
+                
+                # Check if email matches
+                if token_data["email"] != recovery_email:
+                    print(f"[ERROR reset_password] Email mismatch: expected {token_data['email']}, got {recovery_email}")
+                    return jsonify({"error": "Invalid or expired token"}), 401
+                
+                print(f"[DEBUG reset_password] Token verified successfully for {recovery_email}")
+                
+            except Exception as token_error:
+                print(f"[ERROR reset_password] Token verification failed: {str(token_error)}")
+                traceback.print_exc()
+                return jsonify({"error": "Invalid or expired token"}), 401
+            
+            # Look up user by email using admin API
+            try:
+                users_response = supabase.auth.admin.list_users()
+                users_list = users_response if isinstance(users_response, list) else getattr(users_response, 'users', [])
+                
+                target_user = None
+                for user in users_list:
+                    user_email = getattr(user, 'email', None) if hasattr(user, 'email') else user.get('email') if isinstance(user, dict) else None
+                    if user_email and user_email.lower() == recovery_email:
+                        target_user = user
+                        break
+                
+                if target_user:
+                    user_id = getattr(target_user, 'id', None) if hasattr(target_user, 'id') else target_user.get('id') if isinstance(target_user, dict) else None
+                    print(f"[DEBUG reset_password] Found user by email, user_id={user_id}")
+                else:
+                    print(f"[ERROR reset_password] User not found with email: {recovery_email}")
+                    return jsonify({"error": "Invalid or expired token"}), 401
+                    
+            except Exception as lookup_error:
+                print(f"[ERROR reset_password] Failed to lookup user: {str(lookup_error)}")
+                traceback.print_exc()
+                return jsonify({"error": "Invalid or expired token"}), 401
+        
+        else:
+            print(f"[ERROR reset_password] No valid authentication method provided")
+            return jsonify({
+                "error": "Either access_token or (token + email) is required"
+            }), 401
+
+        if not user_id:
+            print(f"[ERROR reset_password] No user_id obtained, returning 401")
+            return jsonify({"error": "Invalid or expired token"}), 401
+
+        print(f"[DEBUG reset_password] Updating password for user_id={user_id}")
+        
+        # Retry logic for Supabase admin API (can timeout)
+        max_retries = 3
+        password_updated = False
+        
+        for attempt in range(max_retries):
+            try:
+                supabase.auth.admin.update_user_by_id(user_id, {"password": new_password})
+                print(f"[SUCCESS reset_password] Password updated successfully on attempt {attempt + 1}")
+                password_updated = True
+                break
+            except Exception as update_error:
+                error_str = str(update_error)
+                print(f"[WARNING reset_password] Attempt {attempt + 1}/{max_retries} failed: {error_str}")
+                
+                if attempt < max_retries - 1 and ("timeout" in error_str.lower() or "timed out" in error_str.lower()):
+                    print(f"[DEBUG reset_password] Retrying after timeout...")
+                    import time
+                    time.sleep(1)  # Brief delay before retry
+                    continue
+                else:
+                    # Re-raise on last attempt or non-timeout errors
+                    raise
+        
+        # Only delete token after successful password update
+        if password_updated and recovery_token:
+            try:
+                supabase.table('password_reset_tokens').delete().eq('token', recovery_token).execute()
+                print(f"[DEBUG reset_password] Token deleted from Supabase after successful password update")
+            except Exception as delete_error:
+                print(f"[WARNING reset_password] Failed to delete token: {str(delete_error)}")
+        
+        return jsonify({"message": "Password reset successful"}), 200
+
+    except Exception as e:
+        print(f"[ERROR reset_password] Exception caught: {str(e)}")
+        traceback.print_exc()
+        error_msg = str(e).lower()
+        if "password" in error_msg and ("weak" in error_msg or "short" in error_msg):
+            return jsonify({
+                "error": "Password too weak",
+                "message": "Password must be at least 6 characters long."
+            }), 400
+        return jsonify({"error": f"Password reset failed: {str(e)}"}), 400
 
 
 @auth_bp.route('/me', methods=['GET'])
