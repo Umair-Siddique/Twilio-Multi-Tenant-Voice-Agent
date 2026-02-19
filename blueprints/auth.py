@@ -59,14 +59,77 @@ def _send_reset_email_via_smtp(email_to, reset_link):
         raise ValueError("SMTP credentials not configured (ADMIN_EMAIL / ADMIN_APP_PASSWORD)")
 
     msg = EmailMessage()
-    msg["Subject"] = "Reset your password"
+    msg["Subject"] = "AiDan Pro - Reset your password"
     msg["From"] = from_email
     msg["To"] = email_to
     msg.set_content(
+        "AiDan Pro Password Reset\n\n"
         "We received a request to reset your password.\n\n"
         f"Reset your password using this link:\n{reset_link}\n\n"
+        "This link expires in 60 minutes.\n\n"
         "If you did not request this, you can ignore this email."
     )
+
+    html_content = f"""
+    <!doctype html>
+    <html lang="en">
+      <head>
+        <meta charset="utf-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+        <title>AiDan Pro - Reset your password</title>
+      </head>
+      <body style="margin:0; padding:0; background-color:#f3f4f6; font-family:Arial, Helvetica, sans-serif; color:#1f2937;">
+        <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="background-color:#f3f4f6; padding:24px 12px;">
+          <tr>
+            <td align="center">
+              <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="max-width:600px; background:#ffffff; border-radius:14px; overflow:hidden; box-shadow:0 10px 30px rgba(0,0,0,0.08);">
+                <tr>
+                  <td style="background:linear-gradient(135deg, #0047ab 0%, #0b5ed7 100%); padding:24px;">
+                    <p style="margin:0; font-size:24px; line-height:1.3; font-weight:700; color:#ffffff;">AiDan Pro</p>
+                    <p style="margin:8px 0 0; font-size:14px; line-height:1.4; color:#e5edff;">Secure account recovery</p>
+                  </td>
+                </tr>
+                <tr>
+                  <td style="padding:28px 24px 20px;">
+                    <h1 style="margin:0 0 12px; font-size:22px; line-height:1.3; color:#111827;">Reset your password</h1>
+                    <p style="margin:0 0 16px; font-size:15px; line-height:1.6; color:#374151;">
+                      We received a request to reset your password. Click the button below to choose a new password.
+                    </p>
+                    <table role="presentation" cellspacing="0" cellpadding="0" style="margin:0 0 18px;">
+                      <tr>
+                        <td align="center" bgcolor="#0047ab" style="border-radius:10px;">
+                          <a href="{reset_link}" style="display:inline-block; padding:12px 24px; font-size:15px; font-weight:700; color:#ffffff; text-decoration:none; border-radius:10px;">
+                            Reset Password
+                          </a>
+                        </td>
+                      </tr>
+                    </table>
+                    <p style="margin:0 0 8px; font-size:13px; line-height:1.6; color:#6b7280;">
+                      This reset link expires in <strong>60 minutes</strong>.
+                    </p>
+                    <p style="margin:0; font-size:13px; line-height:1.6; color:#6b7280;">
+                      If you did not request this, you can safely ignore this email.
+                    </p>
+                  </td>
+                </tr>
+                <tr>
+                  <td style="padding:16px 24px 22px; border-top:1px solid #e5e7eb;">
+                    <p style="margin:0 0 6px; font-size:12px; line-height:1.5; color:#6b7280;">
+                      Button not working? Copy and paste this link into your browser:
+                    </p>
+                    <p style="margin:0; font-size:12px; line-height:1.5; word-break:break-all;">
+                      <a href="{reset_link}" style="color:#0047ab; text-decoration:underline;">{reset_link}</a>
+                    </p>
+                  </td>
+                </tr>
+              </table>
+            </td>
+          </tr>
+        </table>
+      </body>
+    </html>
+    """
+    msg.add_alternative(html_content, subtype="html")
 
     with smtplib.SMTP(smtp_host, smtp_port) as server:
         server.starttls()
