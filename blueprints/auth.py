@@ -54,6 +54,7 @@ def _send_reset_email_via_smtp(email_to, reset_link):
     smtp_host = os.getenv("SMTP_HOST", "smtp.gmail.com")
     smtp_port = int(os.getenv("SMTP_PORT", "587"))
     from_email = os.getenv("SMTP_FROM_EMAIL", smtp_user or "")
+    smtp_timeout = float(os.getenv("SMTP_TIMEOUT_SECONDS", "12"))
 
     if not smtp_user or not smtp_password:
         raise ValueError("SMTP credentials not configured (ADMIN_EMAIL / ADMIN_APP_PASSWORD)")
@@ -131,8 +132,10 @@ def _send_reset_email_via_smtp(email_to, reset_link):
     """
     msg.add_alternative(html_content, subtype="html")
 
-    with smtplib.SMTP(smtp_host, smtp_port) as server:
+    with smtplib.SMTP(smtp_host, smtp_port, timeout=smtp_timeout) as server:
+        server.ehlo()
         server.starttls()
+        server.ehlo()
         server.login(smtp_user, smtp_password)
         server.send_message(msg)
 
@@ -534,8 +537,11 @@ def forgot_password():
             redirect_to = data.get('redirect_to') or os.getenv("PASSWORD_RESET_REDIRECT_URL", "http://localhost:3000/reset-password")
             reset_link = f"{redirect_to}?token={reset_token}&email={email}"
             
-            # Send email
-            _send_reset_email_via_smtp(email_to=email, reset_link=reset_link)
+            # Send email, but do not block API success on transient SMTP issues.
+            try:
+                _send_reset_email_via_smtp(email_to=email, reset_link=reset_link)
+            except Exception as email_error:
+                print(f"[WARNING forgot_password] Email send failed for {email}: {str(email_error)}")
             
             print(f"[DEBUG forgot_password] Generated token for {email}, expires at {expires_at}")
 
