@@ -50,25 +50,63 @@ def _resolve_base_ws_url():
 
 
 def _start_recording_after_delay(app, call_sid, recording_status_callback_url, delay_seconds=3):
-    """Start recording after a short delay so the call is in-progress (does not rely on status callback)."""
+    """Start recording after a short delay so the call is in-progress (does not rely on status callback).
+    This function is completely isolated - any errors will be logged but will never affect the call flow.
+    """
     def run():
-        time.sleep(delay_seconds)
-        with app.app_context():
-            try:
-                client = getattr(app, "twilio_client", None)
-                if not client:
-                    return
-                client.calls(call_sid).recordings.create(
-                    recording_status_callback=recording_status_callback_url,
-                    recording_status_callback_event=["completed"],
-                    recording_channels="dual",
-                )
-                print(f"[Recording] Started recording for call {call_sid} (delayed start)")
-            except Exception as e:
-                print(f"[Recording] Delayed start recording failed: {e}")
+        try:
+            time.sleep(delay_seconds)
+            with app.app_context():
+                try:
+                    client = getattr(app, "twilio_client", None)
+                    if not client:
+                        print(f"[Recording] No Twilio client available for call {call_sid}")
+                        return
+                    
+                    # Check if credentials are configured
+                    if not Config.TWILIO_ACCOUNT_SID or not Config.TWILIO_AUTH_TOKEN:
+                        print(f"[Recording] Twilio credentials not configured, skipping recording for call {call_sid}")
+                        return
+                    
+                    # Verify call is still active before attempting to record
+                    try:
+                        call = client.calls(call_sid).fetch()
+                        if call.status not in ['ringing', 'in-progress', 'queued']:
+                            print(f"[Recording] Call {call_sid} is in status '{call.status}', skipping recording")
+                            return
+                    except Exception as fetch_error:
+                        print(f"[Recording] Could not fetch call status for {call_sid}: {fetch_error}")
+                        # Continue anyway - might be a transient issue
+                    
+                    # Attempt to start recording
+                    recording = client.calls(call_sid).recordings.create(
+                        recording_status_callback=recording_status_callback_url,
+                        recording_status_callback_event=["completed"],
+                        recording_channels="dual",
+                    )
+                    print(f"[Recording] Started recording for call {call_sid} (delayed start), RecordingSid: {recording.sid}")
+                except Exception as e:
+                    error_msg = str(e)
+                    error_type = type(e).__name__
+                    print(f"[Recording] Delayed start recording failed for call {call_sid}: {error_type}: {error_msg}")
+                    print(f"[Recording] Call {call_sid} will continue normally without recording")
+                    # Log full traceback for debugging
+                    import traceback
+                    traceback.print_exc()
+        except Exception as thread_error:
+            # Catch any errors in the thread itself (shouldn't happen, but be safe)
+            print(f"[Recording] Critical error in recording thread for call {call_sid}: {thread_error}")
+            print(f"[Recording] Call {call_sid} will continue normally - recording is optional")
+            import traceback
+            traceback.print_exc()
 
-    t = threading.Thread(target=run, daemon=True)
-    t.start()
+    try:
+        t = threading.Thread(target=run, daemon=True)
+        t.start()
+    except Exception as thread_start_error:
+        # Even thread creation failure shouldn't affect the call
+        print(f"[Recording] Failed to start recording thread for call {call_sid}: {thread_start_error}")
+        print(f"[Recording] Call {call_sid} will continue normally - recording is optional")
 
 
 def _create_call_record(call_sid, from_number, to_number, direction="inbound"):
@@ -112,19 +150,30 @@ def handle_incoming_call():
             response.hangup()
             return str(response), 200, {"Content-Type": "text/xml"}
 
-        if call_sid and getattr(current_app, "supabase_client", None):
-            _create_call_record(call_sid, from_number, to_number)
+        # Create call record (non-blocking - failures won't affect the call)
+        try:
+            if call_sid and getattr(current_app, "supabase_client", None):
+                _create_call_record(call_sid, from_number, to_number)
+        except Exception as db_error:
+            print(f"[Call Record] Failed to create call record (call will continue): {db_error}")
 
         # Start recording after a short delay so we don't rely on Twilio sending "in-progress" (many configs only send "completed").
-        app = current_app._get_current_object()
-        twilio_client = getattr(app, "twilio_client", None)
-        if call_sid and twilio_client and request.host:
-            host = request.headers.get("X-Forwarded-Host") or request.host
-            scheme = request.headers.get("X-Forwarded-Proto") or ("https" if request.is_secure else "http")
-            if "ngrok" in host:
-                scheme = "https"
-            recording_callback_url = f"{scheme}://{host}/voice-agent/recording-status"
-            _start_recording_after_delay(app, call_sid, recording_callback_url)
+        # Wrap in try-except to ensure recording failures never affect the call flow
+        try:
+            app = current_app._get_current_object()
+            twilio_client = getattr(app, "twilio_client", None)
+            if call_sid and twilio_client and request.host:
+                host = request.headers.get("X-Forwarded-Host") or request.host
+                scheme = request.headers.get("X-Forwarded-Proto") or ("https" if request.is_secure else "http")
+                if "ngrok" in host:
+                    scheme = "https"
+                recording_callback_url = f"{scheme}://{host}/voice-agent/recording-status"
+                _start_recording_after_delay(app, call_sid, recording_callback_url)
+        except Exception as recording_init_error:
+            # Log but don't let recording initialization errors affect the call
+            print(f"[Recording] Failed to initialize recording (call will continue): {recording_init_error}")
+            import traceback
+            traceback.print_exc()
 
         ws_url = f"{_resolve_base_ws_url()}/voice-agent/websocket"
         greeting = greeting_prompt
@@ -177,17 +226,32 @@ def handle_call_status():
         if not twilio_client:
             print("[Recording] No Twilio client, cannot start recording")
             return "", 200
+        
+        # Check if credentials are configured
+        if not Config.TWILIO_ACCOUNT_SID or not Config.TWILIO_AUTH_TOKEN:
+            print("[Recording] Twilio credentials not configured, skipping recording")
+            return "", 200
 
         callback_url = _recording_status_callback_url()
         print(f"[Recording] Starting recording for call {call_sid}, will callback to {callback_url}")
-        twilio_client.calls(call_sid).recordings.create(
-            recording_status_callback=callback_url,
-            recording_status_callback_event=["completed"],
-            recording_channels="dual",
-        )
-        print(f"[Recording] Started recording for call {call_sid}")
+        
+        try:
+            recording = twilio_client.calls(call_sid).recordings.create(
+                recording_status_callback=callback_url,
+                recording_status_callback_event=["completed"],
+                recording_channels="dual",
+            )
+            print(f"[Recording] Started recording for call {call_sid}, RecordingSid: {recording.sid}")
+        except Exception as recording_error:
+            error_msg = str(recording_error)
+            error_type = type(recording_error).__name__
+            print(f"[Recording] Failed to create recording for call {call_sid}: {error_type}: {error_msg}")
+            # Don't re-raise - allow call to continue without recording
+            traceback.print_exc()
     except Exception as exc:
-        print(f"[Recording] Error starting recording: {exc}")
+        error_msg = str(exc)
+        error_type = type(exc).__name__
+        print(f"[Recording] Error in call-status handler: {error_type}: {error_msg}")
         traceback.print_exc()
     return "", 200
 

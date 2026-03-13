@@ -24,4 +24,16 @@ def init_websocket(app):
     print("✅ WebSocket support initialized for ConversationRelay")
 
 def init_twilio(app):
-    app.twilio_client = Client(Config.TWILIO_ACCOUNT_SID, Config.TWILIO_AUTH_TOKEN)
+    """Initialize Twilio client with validation"""
+    if Config.TWILIO_ACCOUNT_SID and Config.TWILIO_AUTH_TOKEN:
+        try:
+            app.twilio_client = Client(Config.TWILIO_ACCOUNT_SID, Config.TWILIO_AUTH_TOKEN)
+            # Test the client by fetching account info
+            account = app.twilio_client.api.accounts(Config.TWILIO_ACCOUNT_SID).fetch()
+            print(f"✅ Twilio client initialized successfully (Account: {account.friendly_name})")
+        except Exception as e:
+            print(f"⚠️  Twilio client initialization failed: {e}")
+            app.twilio_client = None
+    else:
+        print("⚠️  Twilio credentials not configured - voice features disabled")
+        app.twilio_client = None
