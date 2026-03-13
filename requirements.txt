@@ -1,5 +1,6 @@
 supabase
 twilio
+requests
 python-dotenv
 Flask
 flask_cors

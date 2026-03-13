@@ -6,3 +6,4 @@ __pycache__/
 TENANT_API_CURL_COMMANDS.md
 test_tenant_apis.ps1
 test_tenant_apis.sh
+project_requirements.txt
