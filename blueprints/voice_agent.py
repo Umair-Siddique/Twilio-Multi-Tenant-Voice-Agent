@@ -7,6 +7,7 @@ import json
 import threading
 import time
 import traceback
+from datetime import datetime, timezone
 import requests
 from flask import Blueprint, current_app, jsonify, request
 from twilio.twiml.voice_response import Connect, ConversationRelay, Language, VoiceResponse
@@ -17,6 +18,8 @@ voice_agent_bp = Blueprint("voice_agent", __name__)
 
 # Active in-memory sessions keyed by ConversationRelay session id.
 active_conversations = {}
+recording_started_calls = set()
+recording_lock = threading.Lock()
 
 
 def _normalize_phone(phone):
@@ -26,19 +29,84 @@ def _normalize_phone(phone):
 
 
 def _resolve_base_ws_url():
-    base_url = Config.WEBSOCKET_BASE_URL
-    if base_url:
-        base_url = base_url.strip().rstrip("/")
+    base_url = (Config.WEBSOCKET_BASE_URL or "").strip().rstrip("/")
+
+    # Prefer the request host for local/ngrok testing so webhook + websocket stay aligned.
+    host = request.headers.get("X-Forwarded-Host") or request.host or ""
+    host_lower = host.lower()
+    is_local_or_tunnel = (
+        "localhost" in host_lower
+        or "127.0.0.1" in host_lower
+        or "ngrok" in host_lower
+    )
+    if is_local_or_tunnel:
+        forwarded_proto = (request.headers.get("X-Forwarded-Proto") or "").lower()
+        scheme = "wss" if forwarded_proto == "https" or request.is_secure else "ws"
+        return f"{scheme}://{host}"
+
     if not base_url or base_url == "wss://your-domain.com":
         scheme = "wss" if request.is_secure else "ws"
-        base_url = f"{scheme}://{request.host}"
-    elif base_url.startswith("https://"):
-        base_url = "wss://" + base_url[len("https://"):]
-    elif base_url.startswith("http://"):
-        base_url = "ws://" + base_url[len("http://"):]
-    elif not (base_url.startswith("wss://") or base_url.startswith("ws://")):
-        base_url = f"wss://{base_url.lstrip('/')}"
+        return f"{scheme}://{request.host}"
+    if base_url.startswith("https://"):
+        return "wss://" + base_url[len("https://"):]
+    if base_url.startswith("http://"):
+        return "ws://" + base_url[len("http://"):]
+    if not (base_url.startswith("wss://") or base_url.startswith("ws://")):
+        return f"wss://{base_url.lstrip('/')}"
     return base_url
+
+
+def _resolve_base_http_url():
+    """
+    Resolve a publicly reachable HTTP(S) base URL for Twilio callbacks.
+    Prioritizes current request host for local/ngrok usage.
+    """
+    host = request.headers.get("X-Forwarded-Host") or request.host or ""
+    host_lower = host.lower()
+    is_local_or_tunnel = (
+        "localhost" in host_lower
+        or "127.0.0.1" in host_lower
+        or "ngrok" in host_lower
+    )
+    if is_local_or_tunnel:
+        forwarded_proto = (request.headers.get("X-Forwarded-Proto") or "").lower()
+        scheme = "https" if forwarded_proto == "https" or request.is_secure else "http"
+        return f"{scheme}://{host}"
+
+    configured = (Config.VOICE_WEBHOOK_URL or "").strip()
+    if configured.startswith("https://") or configured.startswith("http://"):
+        return configured.split("/voice-agent/", 1)[0].rstrip("/")
+
+    scheme = "https" if request.is_secure else "http"
+    return f"{scheme}://{request.host}"
+
+
+def _resolve_tenant_id_for_number(to_number):
+    """Resolve tenant_id from phone_numbers mapping using Twilio To number."""
+    supabase = getattr(current_app, "supabase_client", None)
+    if not supabase or not to_number:
+        return None
+    normalized_to = _normalize_phone(to_number)
+    try:
+        # Try exact match first (most common for E.164 stored values).
+        row = (
+            supabase.table("phone_numbers")
+            .select("tenant_id, phone_number")
+            .eq("phone_number", to_number)
+            .limit(1)
+            .execute()
+        )
+        if row.data and len(row.data) > 0:
+            return row.data[0]["tenant_id"]
+
+        # Fallback: compare normalized values in Python.
+        all_rows = supabase.table("phone_numbers").select("tenant_id, phone_number").execute()
+        for item in all_rows.data or []:
+            if _normalize_phone(item.get("phone_number")) == normalized_to:
+                return item.get("tenant_id")
+    except Exception as e:
+        print(f"[TenantResolution] Failed for number={to_number}: {e}")
+    return None
 
 
 # def _build_system_prompt():
@@ -49,72 +117,26 @@ def _resolve_base_ws_url():
 #     return Config.COMPANY_ASSISTANT_PROMPT or default_prompt
 
 
-def _start_recording_after_delay(app, call_sid, recording_status_callback_url, delay_seconds=3):
-    """Start recording after a short delay so the call is in-progress (does not rely on status callback).
-    This function is completely isolated - any errors will be logged but will never affect the call flow.
-    """
-    def run():
-        try:
-            time.sleep(delay_seconds)
-            with app.app_context():
-                try:
-                    client = getattr(app, "twilio_client", None)
-                    if not client:
-                        print(f"[Recording] No Twilio client available for call {call_sid}")
-                        return
-                    
-                    # Check if credentials are configured
-                    if not Config.TWILIO_ACCOUNT_SID or not Config.TWILIO_AUTH_TOKEN:
-                        print(f"[Recording] Twilio credentials not configured, skipping recording for call {call_sid}")
-                        return
-                    
-                    # Verify call is still active before attempting to record
-                    try:
-                        call = client.calls(call_sid).fetch()
-                        if call.status not in ['ringing', 'in-progress', 'queued']:
-                            print(f"[Recording] Call {call_sid} is in status '{call.status}', skipping recording")
-                            return
-                    except Exception as fetch_error:
-                        print(f"[Recording] Could not fetch call status for {call_sid}: {fetch_error}")
-                        # Continue anyway - might be a transient issue
-                    
-                    # Attempt to start recording
-                    recording = client.calls(call_sid).recordings.create(
-                        recording_status_callback=recording_status_callback_url,
-                        recording_status_callback_event=["completed"],
-                        recording_channels="dual",
-                    )
-                    print(f"[Recording] Started recording for call {call_sid} (delayed start), RecordingSid: {recording.sid}")
-                except Exception as e:
-                    error_msg = str(e)
-                    error_type = type(e).__name__
-                    print(f"[Recording] Delayed start recording failed for call {call_sid}: {error_type}: {error_msg}")
-                    print(f"[Recording] Call {call_sid} will continue normally without recording")
-                    # Log full traceback for debugging
-                    import traceback
-                    traceback.print_exc()
-        except Exception as thread_error:
-            # Catch any errors in the thread itself (shouldn't happen, but be safe)
-            print(f"[Recording] Critical error in recording thread for call {call_sid}: {thread_error}")
-            print(f"[Recording] Call {call_sid} will continue normally - recording is optional")
-            import traceback
-            traceback.print_exc()
-
-    try:
-        t = threading.Thread(target=run, daemon=True)
-        t.start()
-    except Exception as thread_start_error:
-        # Even thread creation failure shouldn't affect the call
-        print(f"[Recording] Failed to start recording thread for call {call_sid}: {thread_start_error}")
-        print(f"[Recording] Call {call_sid} will continue normally - recording is optional")
-
 
 def _create_call_record(call_sid, from_number, to_number, direction="inbound"):
-    """Create call record in database for recording association (no tenant)."""
+    """Create call record in database for recording association."""
     supabase = getattr(current_app, "supabase_client", None)
     if not supabase:
         return None
     try:
+        # Reuse existing call row if already inserted for this call SID.
+        existing = (
+            supabase.table("calls")
+            .select("id")
+            .eq("call_sid", call_sid)
+            .limit(1)
+            .execute()
+        )
+        if existing.data and len(existing.data) > 0:
+            return existing.data[0]["id"]
+
+        tenant_id = _resolve_tenant_id_for_number(to_number)
+
         payload = {
             "call_sid": call_sid,
             "from_number": from_number,
@@ -122,12 +144,48 @@ def _create_call_record(call_sid, from_number, to_number, direction="inbound"):
             "direction": direction,
             "status": "ringing",
         }
+        if tenant_id:
+            payload["tenant_id"] = tenant_id
+        else:
+            print(f"[Call Record] No tenant mapping found for number {to_number}; continuing in non-tenant mode")
+
         row = supabase.table("calls").insert(payload).execute()
         if row.data and len(row.data) > 0:
             return row.data[0]["id"]
     except Exception as e:
         print(f"Failed to create call record: {e}")
     return None
+
+
+def _start_call_recording_if_needed(call_sid):
+    """
+    Start recording an in-progress call via Twilio REST API.
+    Uses a lock + in-memory set to avoid duplicate start attempts.
+    """
+    if not call_sid:
+        return
+    twilio_client = getattr(current_app, "twilio_client", None)
+    if not twilio_client:
+        return
+
+    with recording_lock:
+        if call_sid in recording_started_calls:
+            return
+        recording_started_calls.add(call_sid)
+
+    try:
+        base_http = _resolve_base_http_url().rstrip("/")
+        callback_url = f"{base_http}/voice-agent/recording-status"
+        twilio_client.calls(call_sid).recordings.create(
+            recording_status_callback=callback_url,
+            recording_status_callback_method="POST",
+        )
+        print(f"[Recording] Started recording for call {call_sid}; callback={callback_url}")
+    except Exception as e:
+        # Allow retry on next status callback if this attempt fails.
+        with recording_lock:
+            recording_started_calls.discard(call_sid)
+        print(f"[Recording] Failed to start recording for call {call_sid}: {e}")
 
 
 @voice_agent_bp.route("/incoming-call", methods=["POST"])
@@ -157,25 +215,13 @@ def handle_incoming_call():
         except Exception as db_error:
             print(f"[Call Record] Failed to create call record (call will continue): {db_error}")
 
-        # Start recording after a short delay so we don't rely on Twilio sending "in-progress" (many configs only send "completed").
-        # Wrap in try-except to ensure recording failures never affect the call flow
-        try:
-            app = current_app._get_current_object()
-            twilio_client = getattr(app, "twilio_client", None)
-            if call_sid and twilio_client and request.host:
-                host = request.headers.get("X-Forwarded-Host") or request.host
-                scheme = request.headers.get("X-Forwarded-Proto") or ("https" if request.is_secure else "http")
-                if "ngrok" in host:
-                    scheme = "https"
-                recording_callback_url = f"{scheme}://{host}/voice-agent/recording-status"
-                _start_recording_after_delay(app, call_sid, recording_callback_url)
-        except Exception as recording_init_error:
-            # Log but don't let recording initialization errors affect the call
-            print(f"[Recording] Failed to initialize recording (call will continue): {recording_init_error}")
-            import traceback
-            traceback.print_exc()
-
+        # Build ConversationRelay WebSocket URL and greeting (no recording API calls here).
         ws_url = f"{_resolve_base_ws_url()}/voice-agent/websocket"
+        print(
+            f"[ConversationRelay] CallSid={call_sid} using ws_url={ws_url} "
+            f"(host={request.host}, forwarded_host={request.headers.get('X-Forwarded-Host')}, "
+            f"forwarded_proto={request.headers.get('X-Forwarded-Proto')})"
+        )
         greeting = greeting_prompt
 
         connect = Connect()
@@ -199,60 +245,57 @@ def handle_incoming_call():
         return str(response), 200, {"Content-Type": "text/xml"}
 
 
-def _recording_status_callback_url():
-    """Use same host as current request (e.g. ngrok) so Twilio calls back here when recording is ready."""
-    base = Config.RECORDING_STATUS_CALLBACK_URL
-    if request and request.host and ("ngrok" in request.host or "localhost" in request.host or "127.0.0.1" in request.host):
-        scheme = "https" if request.is_secure or "ngrok" in request.host else "http"
-        base = f"{scheme}://{request.host}/voice-agent/recording-status"
-    return base
-
 
 @voice_agent_bp.route("/call-status", methods=["GET", "POST"])
 def handle_call_status():
     """
-    Twilio status callback. Start recording when call is in-progress.
-    In Twilio Console, set this number's "Status callback URL" to your ngrok URL + /voice-agent/call-status
+    Twilio status callback. Logs call lifecycle events.
+    On completed calls, triggers a fallback recording poll + store flow.
     """
+    call_status = request.values.get("CallStatus")
+    call_sid = request.values.get("CallSid")
+    to_number = request.values.get("To")
+    from_number = request.values.get("From")
+    print(f"[CallStatus] CallSid={call_sid}, Status={call_status}")
+
+    # Keep calls table lifecycle in sync.
     try:
-        call_status = request.values.get("CallStatus")
-        call_sid = request.values.get("CallSid")
-        print(f"[Recording] call-status received: CallSid={call_sid}, CallStatus={call_status}")
+        supabase = getattr(current_app, "supabase_client", None)
+        if supabase and call_sid and call_status:
+            update_data = {"status": call_status}
+            status_lower = call_status.lower()
+            if status_lower == "in-progress":
+                update_data["start_time"] = datetime.now(timezone.utc).isoformat()
+            if status_lower == "completed":
+                update_data["end_time"] = datetime.now(timezone.utc).isoformat()
+                duration = request.values.get("CallDuration")
+                if duration:
+                    try:
+                        update_data["duration_seconds"] = int(duration)
+                    except Exception:
+                        pass
 
-        if call_status != "in-progress" or not call_sid:
-            return "", 200
+            # Ensure call row exists before update for cases where /incoming-call insert failed.
+            if not (
+                supabase.table("calls").select("id").eq("call_sid", call_sid).limit(1).execute().data
+            ):
+                _create_call_record(call_sid, from_number, to_number)
 
-        twilio_client = getattr(current_app, "twilio_client", None)
-        if not twilio_client:
-            print("[Recording] No Twilio client, cannot start recording")
-            return "", 200
-        
-        # Check if credentials are configured
-        if not Config.TWILIO_ACCOUNT_SID or not Config.TWILIO_AUTH_TOKEN:
-            print("[Recording] Twilio credentials not configured, skipping recording")
-            return "", 200
+            supabase.table("calls").update(update_data).eq("call_sid", call_sid).execute()
+    except Exception as e:
+        print(f"[CallStatus] Failed updating call row for {call_sid}: {e}")
 
-        callback_url = _recording_status_callback_url()
-        print(f"[Recording] Starting recording for call {call_sid}, will callback to {callback_url}")
-        
+    # Start recording as soon as Twilio marks call in-progress.
+    if call_sid and (call_status or "").lower() == "in-progress":
+        _start_call_recording_if_needed(call_sid)
+
+    # Fallback: when call completes, poll Twilio recordings and persist if available.
+    if call_sid and (call_status or "").lower() == "completed":
         try:
-            recording = twilio_client.calls(call_sid).recordings.create(
-                recording_status_callback=callback_url,
-                recording_status_callback_event=["completed"],
-                recording_channels="dual",
-            )
-            print(f"[Recording] Started recording for call {call_sid}, RecordingSid: {recording.sid}")
-        except Exception as recording_error:
-            error_msg = str(recording_error)
-            error_type = type(recording_error).__name__
-            print(f"[Recording] Failed to create recording for call {call_sid}: {error_type}: {error_msg}")
-            # Don't re-raise - allow call to continue without recording
-            traceback.print_exc()
-    except Exception as exc:
-        error_msg = str(exc)
-        error_type = type(exc).__name__
-        print(f"[Recording] Error in call-status handler: {error_type}: {error_msg}")
-        traceback.print_exc()
+            _fetch_and_store_recording_async(call_sid)
+        except Exception as e:
+            print(f"[Recording] Failed to start recording polling for call {call_sid}: {e}")
+
     return "", 200
 
 
@@ -291,6 +334,124 @@ def _upload_to_supabase(bucket, path, content, content_type="audio/mpeg"):
         return None
 
 
+def _save_recording_for_call(call_sid, recording_sid, recording_url, recording_duration=None):
+    """Persist Twilio recording bytes to Supabase storage + recordings table."""
+    supabase = getattr(current_app, "supabase_client", None)
+    if not supabase:
+        print("[Recording] No Supabase client")
+        return False
+
+    call_id = None
+    tenant_id = None
+    try:
+        call_row = supabase.table("calls").select("id, tenant_id").eq("call_sid", call_sid).execute()
+        if call_row.data and len(call_row.data) > 0:
+            call_id = call_row.data[0].get("id")
+            tenant_id = call_row.data[0].get("tenant_id")
+    except Exception as e:
+        print(f"[Recording] Could not load call row for {call_sid}: {e}")
+
+    try:
+        existing = (
+            supabase.table("recordings")
+            .select("id")
+            .eq("twilio_recording_sid", recording_sid)
+            .limit(1)
+            .execute()
+        )
+        if existing.data and len(existing.data) > 0:
+            print(f"[Recording] Recording {recording_sid} already stored, skipping duplicate")
+            return True
+    except Exception as e:
+        print(f"[Recording] Could not check existing recording rows (continuing): {e}")
+
+    bucket = Config.RECORDINGS_BUCKET
+    if tenant_id:
+        storage_path = f"tenants/{tenant_id}/recordings/{recording_sid}.mp3"
+    else:
+        storage_path = f"recordings/{call_sid}/{recording_sid}.mp3"
+
+    print(f"[Recording] Downloading from Twilio: {recording_url[:60]}...")
+    audio_bytes = _download_twilio_recording(recording_url)
+    if not audio_bytes:
+        print("[Recording] Download returned no bytes")
+        return False
+
+    print(f"[Recording] Uploading to Supabase bucket={bucket} path={storage_path}")
+    if _upload_to_supabase(bucket, storage_path, audio_bytes):
+        if call_id:
+            payload = {
+                "call_id": call_id,
+                "twilio_recording_sid": recording_sid,
+                "recording_url": recording_url,
+                "storage_path": storage_path,
+                "duration_seconds": int(recording_duration) if recording_duration else None,
+                "status": "available",
+            }
+            if tenant_id:
+                payload["tenant_id"] = tenant_id
+            try:
+                supabase.table("recordings").insert(payload).execute()
+            except Exception as e:
+                print(f"[Recording] File uploaded but recordings row insert failed: {e}")
+        else:
+            print(f"[Recording] File uploaded without DB row (no call row found for {call_sid})")
+        print(f"[Recording] Saved to Supabase: {storage_path}")
+        return True
+    return False
+
+
+def _fetch_and_store_recording_async(call_sid, max_attempts=6, delay_seconds=5):
+    """
+    Fallback recording flow: when call completes, poll Twilio recordings API for this call,
+    then store the first completed recording.
+    """
+    app = current_app._get_current_object()
+
+    def run():
+        with app.app_context():
+            twilio_client = getattr(app, "twilio_client", None)
+            if not twilio_client:
+                print(f"[Recording] No Twilio client available for call {call_sid}")
+                return
+
+            for attempt in range(1, max_attempts + 1):
+                try:
+                    recordings = twilio_client.recordings.list(call_sid=call_sid, limit=10)
+                    print(
+                        f"[Recording] Poll attempt {attempt} for call {call_sid}: "
+                        f"found {len(recordings)} recording(s)"
+                    )
+                    completed = next(
+                        (r for r in recordings if (getattr(r, "status", "") or "").lower() == "completed"),
+                        None
+                    )
+                    if completed:
+                        recording_sid = completed.sid
+                        recording_duration = getattr(completed, "duration", None)
+                        recording_uri = getattr(completed, "uri", "") or ""
+                        recording_url = f"https://api.twilio.com{recording_uri}".replace(".json", "")
+                        print(
+                            f"[Recording] Found completed recording for call {call_sid} "
+                            f"on attempt {attempt}: {recording_sid}"
+                        )
+                        _save_recording_for_call(
+                            call_sid=call_sid,
+                            recording_sid=recording_sid,
+                            recording_url=recording_url,
+                            recording_duration=recording_duration,
+                        )
+                        return
+                except Exception as e:
+                    print(f"[Recording] Poll attempt {attempt} failed for call {call_sid}: {e}")
+
+                time.sleep(delay_seconds)
+
+            print(f"[Recording] No completed recording found for call {call_sid} after {max_attempts} attempts")
+
+    threading.Thread(target=run, daemon=True).start()
+
+
 @voice_agent_bp.route("/recording-status", methods=["GET", "POST"])
 def handle_recording_status():
     """
@@ -304,40 +465,15 @@ def handle_recording_status():
         recording_duration = request.values.get("RecordingDuration")
         print(f"[Recording] recording-status received: CallSid={call_sid}, RecordingSid={recording_sid}, Status={recording_status}")
 
-        if recording_status != "completed" or not call_sid or not recording_sid or not recording_url:
+        if (recording_status or "").lower() != "completed" or not call_sid or not recording_sid or not recording_url:
             return "", 200
 
-        supabase = getattr(current_app, "supabase_client", None)
-        if not supabase:
-            print("[Recording] No Supabase client")
-            return "", 200
-
-        call_row = supabase.table("calls").select("id").eq("call_sid", call_sid).execute()
-        if not call_row.data or len(call_row.data) == 0:
-            print(f"[Recording] No call record for {call_sid}, skipping Supabase upload")
-            return "", 200
-
-        call_id = call_row.data[0]["id"]
-        bucket = Config.RECORDINGS_BUCKET
-        storage_path = f"recordings/{recording_sid}.mp3"
-
-        print(f"[Recording] Downloading from Twilio: {recording_url[:60]}...")
-        audio_bytes = _download_twilio_recording(recording_url)
-        if not audio_bytes:
-            print("[Recording] Download returned no bytes")
-            return "", 200
-
-        print(f"[Recording] Uploading to Supabase bucket={bucket} path={storage_path}")
-        if _upload_to_supabase(bucket, storage_path, audio_bytes):
-            supabase.table("recordings").insert({
-                "call_id": call_id,
-                "twilio_recording_sid": recording_sid,
-                "recording_url": recording_url,
-                "storage_path": storage_path,
-                "duration_seconds": int(recording_duration) if recording_duration else None,
-                "status": "available",
-            }).execute()
-            print(f"[Recording] Saved to Supabase: {storage_path}")
+        _save_recording_for_call(
+            call_sid=call_sid,
+            recording_sid=recording_sid,
+            recording_url=recording_url,
+            recording_duration=recording_duration,
+        )
     except Exception as exc:
         print(f"[Recording] Error processing recording: {exc}")
         traceback.print_exc()
@@ -366,7 +502,16 @@ def register_websocket(app):
                 if event_type in {"connected", "setup", "start"}:
                     session_id = data.get("sessionId")
                     if session_id:
-                        active_conversations[session_id] = [{"role": "system", "content": system_prompt}]
+                        call_sid = data.get("callSid")
+                        active_conversations[session_id] = {
+                            "messages": [{"role": "system", "content": system_prompt}],
+                            "call_sid": call_sid,
+                        }
+                        print(f"[ConversationRelay] Session started session_id={session_id} call_sid={call_sid}")
+                        # Some Twilio number configurations only send "completed" status callback.
+                        # Start recording from ConversationRelay setup to avoid missing recordings.
+                        if call_sid:
+                            _start_call_recording_if_needed(call_sid)
 
                 elif event_type in {"media", "prompt", "input"}:
                     transcript = (
@@ -379,9 +524,12 @@ def register_websocket(app):
                     if not transcript or not session_id:
                         continue
                     if session_id not in active_conversations:
-                        active_conversations[session_id] = [{"role": "system", "content": system_prompt}]
+                        active_conversations[session_id] = {
+                            "messages": [{"role": "system", "content": system_prompt}],
+                            "call_sid": data.get("callSid"),
+                        }
 
-                    messages = active_conversations[session_id]
+                    messages = active_conversations[session_id]["messages"]
                     messages.append({"role": "user", "content": transcript})
                     ai_response = get_openai_response(messages)
                     messages.append({"role": "assistant", "content": ai_response})
@@ -391,6 +539,12 @@ def register_websocket(app):
                     print(f"[ConversationRelay] Sent assistant text token: {ai_response}")
 
                 elif event_type in {"stop", "error"}:
+                    # Fallback trigger: when websocket session ends, try to fetch/store Twilio recording.
+                    if session_id and session_id in active_conversations:
+                        call_sid = active_conversations[session_id].get("call_sid")
+                        if call_sid:
+                            print(f"[Recording] WebSocket ended. Triggering recording poll for call {call_sid}")
+                            _fetch_and_store_recording_async(call_sid)
                     break
         except Exception as exc:
             if "timeout" not in str(exc).lower() and "Connection closed: 1000" not in str(exc):
