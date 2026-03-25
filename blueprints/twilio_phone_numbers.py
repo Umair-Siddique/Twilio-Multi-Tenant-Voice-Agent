@@ -1,6 +1,7 @@
-import os
 from flask import Blueprint, request, jsonify, current_app
+from urllib.parse import urlparse
 from config import Config
+from utils.auth_utils import require_role
 
 
 twilio_bp = Blueprint('twilio', __name__)
@@ -45,15 +46,37 @@ def get_phone_numbers():
 
 
 @twilio_bp.route('/phone-numbers/buy', methods=['POST'])
-def buy_phone_number():
+@require_role(['owner', 'admin'])
+def buy_phone_number(user_id, tenant_id, role):
     """
     Purchase a phone number and attach the voice agent webhook.
     Body: { "phone_number": "+1..." } for a specific number, OR
           { "area_code": "416", "country": "CA" } for any available in that area.
     """
     data = request.get_json(silent=True) or {}
-    voice_url = Config.VOICE_WEBHOOK_URL
-    status_callback = getattr(Config, "CALL_STATUS_CALLBACK_URL", None)
+
+    def _resolve_call_agent_base_http_url():
+        base = (Config.WEBSOCKET_BASE_URL or "").strip().rstrip("/")
+        if base:
+            if base.startswith("wss://"):
+                return "https://" + base[len("wss://"):]
+            if base.startswith("ws://"):
+                return "http://" + base[len("ws://"):]
+            if base.startswith("https://") or base.startswith("http://"):
+                return base
+            return f"https://{base.lstrip('/')}"
+
+        configured_voice = (Config.VOICE_WEBHOOK_URL or "").strip()
+        if configured_voice.startswith("https://") or configured_voice.startswith("http://"):
+            parsed = urlparse(configured_voice)
+            if parsed.scheme and parsed.netloc:
+                return f"{parsed.scheme}://{parsed.netloc}"
+
+        return None
+
+    call_agent_base = _resolve_call_agent_base_http_url()
+    voice_url = f"{call_agent_base}/voice-agent/incoming-call" if call_agent_base else Config.VOICE_WEBHOOK_URL
+    status_callback = f"{call_agent_base}/voice-agent/call-status" if call_agent_base else getattr(Config, "CALL_STATUS_CALLBACK_URL", None)
 
     client = current_app.twilio_client
     params = {
@@ -77,6 +100,27 @@ def buy_phone_number():
 
     try:
         incoming = client.incoming_phone_numbers.create(**params)
+        supabase = getattr(current_app, "supabase_client", None)
+        if supabase:
+            existing = (
+                supabase.table("phone_numbers")
+                .select("id")
+                .eq("phone_number", incoming.phone_number)
+                .limit(1)
+                .execute()
+            )
+            payload = {
+                "tenant_id": tenant_id,
+                "phone_number": incoming.phone_number,
+                "twilio_number_sid": incoming.sid,
+                "country_code": country,
+                "status": "active",
+            }
+            if existing.data and len(existing.data) > 0:
+                supabase.table("phone_numbers").update(payload).eq("id", existing.data[0]["id"]).execute()
+            else:
+                supabase.table("phone_numbers").insert(payload).execute()
+
         return jsonify({
             "sid": incoming.sid,
             "phone_number": incoming.phone_number,

@@ -74,6 +74,7 @@ CREATE TABLE tenant_agent_config (
     tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE UNIQUE,
     agent_pack_id UUID REFERENCES agent_packs(id),
     greeting TEXT,
+    system_prompt TEXT, -- Optional tenant LLM system prompt; when null, backend default applies
     tone VARCHAR(100) DEFAULT 'professional',
     business_hours JSONB DEFAULT '{}', -- { "monday": {"start": "09:00", "end": "17:00"}, ... }
     escalation_rules JSONB DEFAULT '{}', -- Rules for when to escalate to human

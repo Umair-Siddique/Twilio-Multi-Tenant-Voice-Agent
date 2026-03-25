@@ -104,7 +104,7 @@ def update_agent_config(user_id, tenant_id, role):
     
     # Allowed fields to update
     allowed_fields = [
-        'greeting', 'tone', 'business_hours', 'escalation_rules',
+        'greeting', 'system_prompt', 'tone', 'business_hours', 'escalation_rules',
         'allowed_actions', 'custom_prompts', 'store_transcripts',
         'store_recordings', 'retention_days'
     ]

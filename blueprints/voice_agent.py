@@ -91,8 +91,9 @@ def _resolve_tenant_id_for_number(to_number):
         # Try exact match first (most common for E.164 stored values).
         row = (
             supabase.table("phone_numbers")
-            .select("tenant_id, phone_number")
+            .select("tenant_id, phone_number, status")
             .eq("phone_number", to_number)
+            .eq("status", "active")
             .limit(1)
             .execute()
         )
@@ -100,13 +101,76 @@ def _resolve_tenant_id_for_number(to_number):
             return row.data[0]["tenant_id"]
 
         # Fallback: compare normalized values in Python.
-        all_rows = supabase.table("phone_numbers").select("tenant_id, phone_number").execute()
+        all_rows = supabase.table("phone_numbers").select("tenant_id, phone_number, status").execute()
         for item in all_rows.data or []:
-            if _normalize_phone(item.get("phone_number")) == normalized_to:
+            if item.get("status") == "active" and _normalize_phone(item.get("phone_number")) == normalized_to:
                 return item.get("tenant_id")
     except Exception as e:
         print(f"[TenantResolution] Failed for number={to_number}: {e}")
     return None
+
+
+def _resolve_tenant_id_for_call_sid(call_sid):
+    """Resolve tenant_id from calls table using call_sid."""
+    supabase = getattr(current_app, "supabase_client", None)
+    if not supabase or not call_sid:
+        return None
+    try:
+        row = (
+            supabase.table("calls")
+            .select("tenant_id")
+            .eq("call_sid", call_sid)
+            .limit(1)
+            .execute()
+        )
+        if row.data and len(row.data) > 0:
+            return row.data[0].get("tenant_id")
+    except Exception as e:
+        print(f"[TenantResolution] Failed for call_sid={call_sid}: {e}")
+    return None
+
+
+def _get_tenant_agent_config(tenant_id):
+    """Load tenant-specific voice agent configuration."""
+    supabase = getattr(current_app, "supabase_client", None)
+    if not supabase or not tenant_id:
+        return {}
+    try:
+        row = (
+            supabase.table("tenant_agent_config")
+            .select("greeting, tone, system_prompt, custom_prompts")
+            .eq("tenant_id", tenant_id)
+            .limit(1)
+            .execute()
+        )
+        if row.data and len(row.data) > 0:
+            return row.data[0] or {}
+    except Exception as e:
+        print(f"[TenantConfig] Failed loading tenant config for {tenant_id}: {e}")
+    return {}
+
+
+def _build_system_prompt_for_tenant(tenant_config):
+    """Build final system prompt from tenant override or global default, plus tone/custom_prompts."""
+    tenant_override = ((tenant_config or {}).get("system_prompt") or "").strip()
+    final_prompt = tenant_override if tenant_override else (system_prompt or "").strip()
+    tone = (tenant_config or {}).get("tone")
+    if tone:
+        final_prompt += f"\n\nTenant tone requirement: Use a {tone} tone consistently."
+
+    custom_prompts = (tenant_config or {}).get("custom_prompts")
+    if isinstance(custom_prompts, dict) and custom_prompts:
+        prompt_chunks = []
+        for key in sorted(custom_prompts.keys()):
+            value = custom_prompts.get(key)
+            if value is not None and str(value).strip():
+                prompt_chunks.append(f"{key}: {value}")
+        if prompt_chunks:
+            final_prompt += "\n\nTenant custom instructions:\n" + "\n".join(prompt_chunks)
+    elif isinstance(custom_prompts, str) and custom_prompts.strip():
+        final_prompt += f"\n\nTenant custom instructions:\n{custom_prompts.strip()}"
+
+    return final_prompt or system_prompt
 
 
 # def _build_system_prompt():
@@ -198,11 +262,8 @@ def handle_incoming_call():
         from_number = request.form.get("From", "")
         call_sid = request.form.get("CallSid", "")
 
-        configured_number = (
-            Config.TWILIO_PHONE_NUMBER
-            or Config.TWILIO_PHONE_NUMER
-        )
-        if not configured_number or _normalize_phone(to_number) != _normalize_phone(configured_number):
+        tenant_id = _resolve_tenant_id_for_number(to_number)
+        if not tenant_id:
             response = VoiceResponse()
             response.say("This number is not configured for the assistant. Goodbye.")
             response.hangup()
@@ -216,13 +277,14 @@ def handle_incoming_call():
             print(f"[Call Record] Failed to create call record (call will continue): {db_error}")
 
         # Build ConversationRelay WebSocket URL and greeting (no recording API calls here).
-        ws_url = f"{_resolve_base_ws_url()}/voice-agent/websocket"
+        ws_url = f"{_resolve_base_ws_url()}/voice-agent/websocket?tenant_id={tenant_id}&call_sid={call_sid}"
         print(
             f"[ConversationRelay] CallSid={call_sid} using ws_url={ws_url} "
             f"(host={request.host}, forwarded_host={request.headers.get('X-Forwarded-Host')}, "
             f"forwarded_proto={request.headers.get('X-Forwarded-Proto')})"
         )
-        greeting = greeting_prompt
+        tenant_config = _get_tenant_agent_config(tenant_id)
+        greeting = tenant_config.get("greeting") or greeting_prompt
 
         connect = Connect()
         conversation_relay = ConversationRelay(
@@ -489,6 +551,8 @@ def register_websocket(app):
     @app.sock.route("/voice-agent/websocket")
     def handle_websocket(ws):
         session_id = None
+        ws_tenant_id = request.args.get("tenant_id")
+        ws_call_sid = request.args.get("call_sid")
         try:
             while True:
                 raw_message = ws.receive(timeout=1)
@@ -502,10 +566,14 @@ def register_websocket(app):
                 if event_type in {"connected", "setup", "start"}:
                     session_id = data.get("sessionId")
                     if session_id:
-                        call_sid = data.get("callSid")
+                        call_sid = data.get("callSid") or ws_call_sid
+                        tenant_id = ws_tenant_id or _resolve_tenant_id_for_call_sid(call_sid)
+                        tenant_config = _get_tenant_agent_config(tenant_id) if tenant_id else {}
+                        tenant_system_prompt = _build_system_prompt_for_tenant(tenant_config)
                         active_conversations[session_id] = {
-                            "messages": [{"role": "system", "content": system_prompt}],
+                            "messages": [{"role": "system", "content": tenant_system_prompt}],
                             "call_sid": call_sid,
+                            "tenant_id": tenant_id,
                         }
                         print(f"[ConversationRelay] Session started session_id={session_id} call_sid={call_sid}")
                         # Some Twilio number configurations only send "completed" status callback.
@@ -524,9 +592,14 @@ def register_websocket(app):
                     if not transcript or not session_id:
                         continue
                     if session_id not in active_conversations:
+                        call_sid = data.get("callSid") or ws_call_sid
+                        tenant_id = ws_tenant_id or _resolve_tenant_id_for_call_sid(call_sid)
+                        tenant_config = _get_tenant_agent_config(tenant_id) if tenant_id else {}
+                        tenant_system_prompt = _build_system_prompt_for_tenant(tenant_config)
                         active_conversations[session_id] = {
-                            "messages": [{"role": "system", "content": system_prompt}],
-                            "call_sid": data.get("callSid"),
+                            "messages": [{"role": "system", "content": tenant_system_prompt}],
+                            "call_sid": call_sid,
+                            "tenant_id": tenant_id,
                         }
 
                     messages = active_conversations[session_id]["messages"]
