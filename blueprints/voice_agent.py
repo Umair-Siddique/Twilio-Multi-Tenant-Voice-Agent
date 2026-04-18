@@ -3,16 +3,27 @@ Minimal voice agent using Twilio ConversationRelay + OpenAI.
 Includes call recording and Supabase storage.
 Uses only Config.TWILIO_PHONE_NUMBER (no tenant lookup).
 """
+import copy
 import json
 import threading
 import time
 import traceback
 from datetime import datetime, timezone
+
 import requests
 from flask import Blueprint, current_app, jsonify, request
 from twilio.twiml.voice_response import Connect, ConversationRelay, Language, VoiceResponse
+
 from config import Config
 from utils.system_prompt import system_prompt, greeting_prompt
+from utils.tenant_google_calendar_credentials import (
+    load_credentials_json_for_tenant,
+    tenant_may_use_calendar_tools,
+)
+from utils.tenant_hubspot_credentials import (
+    load_hubspot_access_token_for_tenant,
+    tenant_may_use_hubspot_tools,
+)
 
 voice_agent_bp = Blueprint("voice_agent", __name__)
 
@@ -138,7 +149,7 @@ def _get_tenant_agent_config(tenant_id):
     try:
         row = (
             supabase.table("tenant_agent_config")
-            .select("greeting, tone, system_prompt, custom_prompts")
+            .select("greeting, tone, system_prompt, custom_prompts, allowed_actions")
             .eq("tenant_id", tenant_id)
             .limit(1)
             .execute()
@@ -171,6 +182,168 @@ def _build_system_prompt_for_tenant(tenant_config):
         final_prompt += f"\n\nTenant custom instructions:\n{custom_prompts.strip()}"
 
     return final_prompt or system_prompt
+
+
+_VOICE_CALENDAR_OPENAI_CACHE = None
+_VOICE_HUBSPOT_OPENAI_CACHE = None
+
+
+def _strip_credentials_from_openai_tool(definition: dict) -> dict:
+    """Remove credentials_json from tool schema; server injects it on execution."""
+    out = copy.deepcopy(definition)
+    fn = out.get("function") or {}
+    params = dict(fn.get("parameters") or {})
+    props = dict(params.get("properties") or {})
+    props.pop("credentials_json", None)
+    params["properties"] = props
+    req = [x for x in (params.get("required") or []) if x != "credentials_json"]
+    if req:
+        params["required"] = req
+    else:
+        params.pop("required", None)
+    fn["parameters"] = params
+    out["function"] = fn
+    return out
+
+
+def _strip_access_token_from_openai_tool(definition: dict) -> dict:
+    """Remove access_token from tool schema; server injects it on execution."""
+    out = copy.deepcopy(definition)
+    fn = out.get("function") or {}
+    params = dict(fn.get("parameters") or {})
+    props = dict(params.get("properties") or {})
+    props.pop("access_token", None)
+    params["properties"] = props
+    req = [x for x in (params.get("required") or []) if x != "access_token"]
+    if req:
+        params["required"] = req
+    else:
+        params.pop("required", None)
+    fn["parameters"] = params
+    out["function"] = fn
+    return out
+
+
+def _voice_calendar_tool_defs_and_map():
+    global _VOICE_CALENDAR_OPENAI_CACHE
+    if _VOICE_CALENDAR_OPENAI_CACHE is not None:
+        return _VOICE_CALENDAR_OPENAI_CACHE
+    from langchain_core.utils.function_calling import convert_to_openai_tool
+
+    from tools.google_calendar_tools import create_event, get_freebusy, list_events, quick_add_event
+
+    raw_tools = [list_events, create_event, quick_add_event, get_freebusy]
+    defs = []
+    by_name = {}
+    for t in raw_tools:
+        d = convert_to_openai_tool(t)
+        defs.append(_strip_credentials_from_openai_tool(d))
+        by_name[t.name] = t
+    _VOICE_CALENDAR_OPENAI_CACHE = (defs, by_name)
+    return _VOICE_CALENDAR_OPENAI_CACHE
+
+
+def _voice_hubspot_tool_defs_and_map():
+    global _VOICE_HUBSPOT_OPENAI_CACHE
+    if _VOICE_HUBSPOT_OPENAI_CACHE is not None:
+        return _VOICE_HUBSPOT_OPENAI_CACHE
+    from langchain_core.utils.function_calling import convert_to_openai_tool
+
+    from tools.hubspot_tools import HUBSPOT_VOICE_TOOLS
+
+    defs = []
+    by_name = {}
+    for t in HUBSPOT_VOICE_TOOLS:
+        d = convert_to_openai_tool(t)
+        defs.append(_strip_access_token_from_openai_tool(d))
+        by_name[t.name] = t
+    _VOICE_HUBSPOT_OPENAI_CACHE = (defs, by_name)
+    return _VOICE_HUBSPOT_OPENAI_CACHE
+
+
+def _voice_end_call_openai_tool():
+    """OpenAI function schema: model requests hangup when the caller is clearly done."""
+    return {
+        "type": "function",
+        "function": {
+            "name": "end_call",
+            "description": (
+                "End the phone call. Use only when the caller clearly wants to hang up or is finished "
+                "(goodbye, thanks bye, that is all, talk later, no more questions, etc.). "
+                "Do not use if they may still need help. Give a brief spoken goodbye in the same turn when possible."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "reason": {
+                        "type": "string",
+                        "description": "Short note, e.g. user said goodbye.",
+                    }
+                },
+            },
+        },
+    }
+
+
+def _hangup_twilio_call(call_sid):
+    """Terminate an in-progress Twilio call (parent leg)."""
+    if not call_sid:
+        return
+    twilio_client = getattr(current_app, "twilio_client", None)
+    if not twilio_client:
+        print(f"[Hangup] No Twilio client; cannot end CallSid={call_sid}")
+        return
+    try:
+        twilio_client.calls(call_sid).update(status="completed")
+        print(f"[Hangup] CallSid={call_sid} status set to completed")
+    except Exception as exc:
+        print(f"[Hangup] Failed for CallSid={call_sid}: {exc}")
+
+
+def _init_voice_session_state(tenant_id, tenant_config, call_sid):
+    """Initial messages + optional integration credentials for tool calling."""
+    tenant_system_prompt = _build_system_prompt_for_tenant(tenant_config)
+    supabase = getattr(current_app, "supabase_client", None)
+    allowed = tenant_config.get("allowed_actions")
+
+    cred_json = None
+    if tenant_id and supabase and tenant_may_use_calendar_tools(allowed):
+        cred_json = load_credentials_json_for_tenant(supabase, tenant_id)
+
+    hubspot_token = None
+    if tenant_id and supabase and tenant_may_use_hubspot_tools(allowed):
+        hubspot_token = load_hubspot_access_token_for_tenant(supabase, tenant_id)
+
+    suffix_parts = []
+    if cred_json:
+        suffix_parts.append(
+            "\n\nThis company has connected Google Calendar for this assistant. "
+            "Use the provided tools to list events, check availability, create events, or quick-add events. "
+            "Never tell the caller you cannot access Calendar if the tools succeed. "
+            "For new events, confirm title, date, start/end time (or duration), and timezone when unclear. "
+            "Keep replies short and natural for a phone call."
+        )
+    if hubspot_token:
+        suffix_parts.append(
+            "\n\nThis company has connected HubSpot CRM for this assistant. "
+            "Use the HubSpot tools to find or update contacts and companies, log call notes, and manage "
+            "support tickets when relevant. Never ask the caller for API keys. "
+            "Summarize tool results briefly for a phone conversation."
+        )
+    suffix_parts.append(
+        "\n\nWhen the caller clearly wants to end the conversation (goodbye, thanks, that is all, "
+        "speak later, etc.), give a brief polite closing in your spoken reply and call the end_call function "
+        "so the phone line can disconnect. Do not use end_call if they may still need help."
+    )
+    suffix = "".join(suffix_parts)
+
+    return {
+        "messages": [{"role": "system", "content": tenant_system_prompt + suffix}],
+        "call_sid": call_sid,
+        "tenant_id": tenant_id,
+        "credentials_json": cred_json,
+        "hubspot_access_token": hubspot_token,
+    }
 
 
 # def _build_system_prompt():
@@ -569,12 +742,9 @@ def register_websocket(app):
                         call_sid = data.get("callSid") or ws_call_sid
                         tenant_id = ws_tenant_id or _resolve_tenant_id_for_call_sid(call_sid)
                         tenant_config = _get_tenant_agent_config(tenant_id) if tenant_id else {}
-                        tenant_system_prompt = _build_system_prompt_for_tenant(tenant_config)
-                        active_conversations[session_id] = {
-                            "messages": [{"role": "system", "content": tenant_system_prompt}],
-                            "call_sid": call_sid,
-                            "tenant_id": tenant_id,
-                        }
+                        active_conversations[session_id] = _init_voice_session_state(
+                            tenant_id, tenant_config, call_sid
+                        )
                         print(f"[ConversationRelay] Session started session_id={session_id} call_sid={call_sid}")
                         # Some Twilio number configurations only send "completed" status callback.
                         # Start recording from ConversationRelay setup to avoid missing recordings.
@@ -595,21 +765,48 @@ def register_websocket(app):
                         call_sid = data.get("callSid") or ws_call_sid
                         tenant_id = ws_tenant_id or _resolve_tenant_id_for_call_sid(call_sid)
                         tenant_config = _get_tenant_agent_config(tenant_id) if tenant_id else {}
-                        tenant_system_prompt = _build_system_prompt_for_tenant(tenant_config)
-                        active_conversations[session_id] = {
-                            "messages": [{"role": "system", "content": tenant_system_prompt}],
-                            "call_sid": call_sid,
-                            "tenant_id": tenant_id,
-                        }
+                        active_conversations[session_id] = _init_voice_session_state(
+                            tenant_id, tenant_config, call_sid
+                        )
 
                     messages = active_conversations[session_id]["messages"]
                     messages.append({"role": "user", "content": transcript})
-                    ai_response = get_openai_response(messages)
+                    # Refresh OAuth blob each turn (token refresh + newly connected calendar).
+                    tid = active_conversations[session_id].get("tenant_id")
+                    supabase = getattr(current_app, "supabase_client", None)
+                    cred_json = active_conversations[session_id].get("credentials_json")
+                    hubspot_token = active_conversations[session_id].get("hubspot_access_token")
+                    if tid and supabase:
+                        cfg = _get_tenant_agent_config(tid)
+                        if tenant_may_use_calendar_tools(cfg.get("allowed_actions")):
+                            cred_json = load_credentials_json_for_tenant(supabase, tid)
+                            active_conversations[session_id]["credentials_json"] = cred_json
+                        if tenant_may_use_hubspot_tools(cfg.get("allowed_actions")):
+                            hubspot_token = load_hubspot_access_token_for_tenant(supabase, tid)
+                            active_conversations[session_id]["hubspot_access_token"] = hubspot_token
+                    hangup_state = {"requested": False}
+                    ai_response = get_openai_response(
+                        messages,
+                        credentials_json=cred_json,
+                        hubspot_access_token=hubspot_token,
+                        hangup_state=hangup_state,
+                    )
                     messages.append({"role": "assistant", "content": ai_response})
 
                     # ConversationRelay output format (text token).
                     ws.send(json.dumps({"type": "text", "token": ai_response, "last": True}))
                     print(f"[ConversationRelay] Sent assistant text token: {ai_response}")
+
+                    if hangup_state.get("requested"):
+                        hangup_call_sid = active_conversations[session_id].get("call_sid")
+                        app_obj = current_app._get_current_object()
+
+                        def _delayed_hangup():
+                            time.sleep(2.5)
+                            with app_obj.app_context():
+                                _hangup_twilio_call(hangup_call_sid)
+
+                        threading.Thread(target=_delayed_hangup, daemon=True).start()
 
                 elif event_type in {"stop", "error"}:
                     # Fallback trigger: when websocket session ends, try to fetch/store Twilio recording.
@@ -628,21 +825,117 @@ def register_websocket(app):
                 del active_conversations[session_id]
 
 
-def get_openai_response(messages):
+def get_openai_response(
+    messages,
+    credentials_json=None,
+    hubspot_access_token=None,
+    hangup_state=None,
+):
     try:
         openai_client = current_app.openai_client
         if not openai_client:
             return "I am sorry, the AI service is currently unavailable."
 
-        response = openai_client.chat.completions.create(
-            model=Config.OPENAI_MODEL,
-            messages=messages,
-            temperature=0.7,
-            max_tokens=160,
-        )
-        if response.choices:
-            return (response.choices[0].message.content or "").strip() or "Could you repeat that, please?"
-        return "Could you repeat that, please?"
+        cal_defs, cal_by_name = ([], {})
+        if credentials_json:
+            cal_defs, cal_by_name = _voice_calendar_tool_defs_and_map()
+        hub_defs, hub_by_name = ([], {})
+        if hubspot_access_token:
+            hub_defs, hub_by_name = _voice_hubspot_tool_defs_and_map()
+
+        tools_defs = [_voice_end_call_openai_tool()]
+        if cal_defs:
+            tools_defs = tools_defs + list(cal_defs)
+        if hub_defs:
+            tools_defs = tools_defs + list(hub_defs)
+
+        msgs = [dict(m) for m in messages]
+        max_rounds = 5
+        for _ in range(max_rounds):
+            create_kwargs = {
+                "model": Config.OPENAI_MODEL,
+                "messages": msgs,
+                "temperature": 0.5,
+                "tools": tools_defs,
+                "tool_choice": "auto",
+                "max_tokens": 1100 if len(tools_defs) > 6 else 900,
+            }
+
+            response = openai_client.chat.completions.create(**create_kwargs)
+            msg = response.choices[0].message
+
+            if not msg.tool_calls:
+                return (msg.content or "").strip() or "Could you repeat that, please?"
+
+            assistant_payload = {
+                "role": "assistant",
+                "content": msg.content or "",
+                "tool_calls": [
+                    {
+                        "id": tc.id,
+                        "type": "function",
+                        "function": {
+                            "name": tc.function.name,
+                            "arguments": tc.function.arguments or "{}",
+                        },
+                    }
+                    for tc in msg.tool_calls
+                ],
+            }
+            msgs.append(assistant_payload)
+
+            for tc in msg.tool_calls:
+                name = tc.function.name
+                try:
+                    args = json.loads(tc.function.arguments or "{}")
+                except json.JSONDecodeError:
+                    args = {}
+
+                tool_fn = None
+                if name in cal_by_name:
+                    tool_fn = cal_by_name[name]
+                    if not credentials_json:
+                        content = json.dumps({"error": "calendar_tool_unavailable"})
+                    else:
+                        args["credentials_json"] = credentials_json
+                        try:
+                            result = tool_fn.invoke(args)
+                        except Exception as tool_exc:
+                            print(f"[GoogleCalendar] tool {name} error: {tool_exc}")
+                            traceback.print_exc()
+                            result = {"error": str(tool_exc)}
+                        if isinstance(result, dict):
+                            content = json.dumps(result, default=str)[:12000]
+                        else:
+                            content = str(result)[:12000]
+                elif name in hub_by_name:
+                    tool_fn = hub_by_name[name]
+                    if not hubspot_access_token:
+                        content = json.dumps({"error": "hubspot_tool_unavailable"})
+                    else:
+                        args["access_token"] = hubspot_access_token
+                        try:
+                            result = tool_fn.invoke(args)
+                        except Exception as tool_exc:
+                            print(f"[HubSpot] tool {name} error: {tool_exc}")
+                            traceback.print_exc()
+                            result = {"error": str(tool_exc)}
+                        if isinstance(result, dict):
+                            content = json.dumps(result, default=str)[:12000]
+                        else:
+                            content = str(result)[:12000]
+                elif name == "end_call":
+                    if hangup_state is not None:
+                        hangup_state["requested"] = True
+                    content = json.dumps(
+                        {"status": "ok", "message": "Hang up after your closing message to the caller."}
+                    )
+                else:
+                    content = json.dumps({"error": "tool_unavailable"})
+
+                msgs.append({"role": "tool", "tool_call_id": tc.id, "content": content})
+
+        return "I could not finish that request in time. Please try again."
     except Exception as exc:
         print(f"OpenAI response error: {exc}")
         traceback.print_exc()

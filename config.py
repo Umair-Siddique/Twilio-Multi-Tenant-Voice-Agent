@@ -4,6 +4,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 class Config:
+    FLASK_SECRET_KEY = os.getenv("FLASK_SECRET_KEY")
     SUPABASE_SECRET_KEY = os.getenv("SUPABASE_SECRET_KEY")
     SUPABASE_URL = os.getenv("SUPABASE_URL")
     OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
@@ -44,3 +45,19 @@ class Config:
 
     ADMIN_EMAIL = os.getenv("ADMIN_EMAIL")
     ADMIN_APP_PASSWORD = os.getenv("ADMIN_APP_PASSWORD")
+
+    # Google Calendar OAuth (server-managed web OAuth client)
+    GOOGLE_OAUTH_CLIENT_ID = os.getenv("GOOGLE_OAUTH_CLIENT_ID")
+    GOOGLE_OAUTH_CLIENT_SECRET = os.getenv("GOOGLE_OAUTH_CLIENT_SECRET")
+    GOOGLE_OAUTH_SCOPES = os.getenv(
+        "GOOGLE_OAUTH_SCOPES",
+        "https://www.googleapis.com/auth/calendar"
+    )
+    GOOGLE_CALENDAR_OAUTH_REDIRECT_URI = os.getenv("GOOGLE_CALENDAR_OAUTH_REDIRECT_URI")
+    GOOGLE_CALENDAR_CONNECT_SUCCESS_URL = os.getenv("GOOGLE_CALENDAR_CONNECT_SUCCESS_URL")
+    GOOGLE_CALENDAR_CONNECT_ERROR_URL = os.getenv("GOOGLE_CALENDAR_CONNECT_ERROR_URL")
+
+    # Symmetric encryption key (Fernet) for integration credentials at rest.
+    CREDENTIAL_ENCRYPTION_KEY = os.getenv("CREDENTIAL_ENCRYPTION_KEY")
+    # MCP_API_KEY = os.getenv("MCP_API_KEY")
+    # MCP_SERVER_URL = os.getenv("MCP_SERVER_URL")

@@ -8,3 +8,10 @@ websockets
 flask-sock
 openai
 gunicorn
+langchain-core
+google-api-python-client
+google-auth
+google-auth-oauthlib
+hubspot-api-client
+cryptography
+flask_sock

@@ -4,6 +4,7 @@ from flask_sock import Sock
 from config import Config
 from twilio.rest import Client
 
+
 def init_openai(app):
     app.openai_client = OpenAIClient(api_key=Config.OPENAI_API_KEY)
 
@@ -37,3 +38,15 @@ def init_twilio(app):
     else:
         print("⚠️  Twilio credentials not configured - voice features disabled")
         app.twilio_client = None
+
+# def init_mcp_server(app):
+#     "Initialize mcp server"
+#     if Config.MCP_SERVER_URL and Config.MCP_API_KEY:
+#         transport = StreamableHttpTransport(
+#                     Config.MCP_SERVER_URL,
+#                     headers={"Authorization": f"Bearer {Config.MCP_API_KEY}"})
+#         app.mcp_client = Client(transport=transport)
+#     else:
+#         print("⚠️  MCP Server url or MCP api key not found")
+#         app.mcp_client=None
+
