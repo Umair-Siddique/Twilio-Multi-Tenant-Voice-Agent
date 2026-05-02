@@ -1,6 +1,5 @@
 from flask import Blueprint, request, jsonify, current_app
 from functools import wraps
-import os
 import smtplib
 import traceback
 import secrets
@@ -51,10 +50,10 @@ def _send_reset_email_via_smtp(email_to, reset_link):
     """Send password reset email using SMTP instead of Supabase email service."""
     smtp_user = Config.ADMIN_EMAIL
     smtp_password = Config.ADMIN_APP_PASSWORD
-    smtp_host = os.getenv("SMTP_HOST", "smtp.gmail.com")
-    smtp_port = int(os.getenv("SMTP_PORT", "587"))
-    from_email = os.getenv("SMTP_FROM_EMAIL", smtp_user or "")
-    smtp_timeout = float(os.getenv("SMTP_TIMEOUT_SECONDS", "12"))
+    smtp_host = Config.SMTP_HOST
+    smtp_port = Config.SMTP_PORT
+    from_email = Config.SMTP_FROM_EMAIL or smtp_user or ""
+    smtp_timeout = Config.SMTP_TIMEOUT_SECONDS
 
     if not smtp_user or not smtp_password:
         raise ValueError("SMTP credentials not configured (ADMIN_EMAIL / ADMIN_APP_PASSWORD)")
@@ -534,7 +533,7 @@ def forgot_password():
             _cleanup_expired_tokens(supabase)
             
             # Build reset link
-            redirect_to = data.get('redirect_to') or os.getenv("PASSWORD_RESET_REDIRECT_URL", "http://localhost:3000/reset-password")
+            redirect_to = data.get('redirect_to') or Config.PASSWORD_RESET_REDIRECT_URL
             reset_link = f"{redirect_to}?token={reset_token}&email={email}"
             
             # Send email, but do not block API success on transient SMTP issues.

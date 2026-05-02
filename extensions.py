@@ -1,52 +1,112 @@
+import httpx
 from openai import OpenAI as OpenAIClient
-from supabase import create_client, Client
+from supabase import create_client
 from flask_sock import Sock
+from twilio.rest import Client as TwilioClient
+
 from config import Config
-from twilio.rest import Client
 
 
 def init_openai(app):
-    app.openai_client = OpenAIClient(api_key=Config.OPENAI_API_KEY)
+    transport = httpx.HTTPTransport(
+        retries=3,
+        limits=httpx.Limits(
+            max_connections=Config.OPENAI_HTTP_MAX_CONNECTIONS,
+            max_keepalive_connections=Config.OPENAI_HTTP_MAX_KEEPALIVE,
+            keepalive_expiry=Config.OPENAI_HTTP_KEEPALIVE_EXPIRY,
+        ),
+    )
+    http_client = httpx.Client(
+        transport=transport,
+        timeout=httpx.Timeout(
+            connect=Config.OPENAI_HTTP_CONNECT_TIMEOUT,
+            read=Config.OPENAI_HTTP_READ_TIMEOUT,
+            write=Config.OPENAI_HTTP_READ_TIMEOUT,
+            pool=Config.OPENAI_HTTP_CONNECT_TIMEOUT,
+        ),
+    )
+    app.openai_client = OpenAIClient(api_key=Config.OPENAI_API_KEY, http_client=http_client)
+    print("✅ OpenAI client initialized")
+
 
 def init_supabase(app):
-    """Initialize Supabase client"""
-    if Config.SUPABASE_URL and Config.SUPABASE_SECRET_KEY:
-        client = create_client(Config.SUPABASE_URL, Config.SUPABASE_SECRET_KEY)
-        app.supabase_client = client
-        
-        print("✅ Supabase client initialized successfully")
-    else:
+    if not Config.SUPABASE_URL or not Config.SUPABASE_SECRET_KEY:
         app.supabase_client = None
         print("⚠️  Supabase not configured - conversation storage disabled")
+        return
+
+    try:
+        from supabase.lib.client_options import ClientOptions
+
+        transport = httpx.HTTPTransport(
+            retries=Config.SUPABASE_HTTP_RETRIES,
+            http2=False,
+            limits=httpx.Limits(
+                max_connections=Config.SUPABASE_HTTP_MAX_CONNECTIONS,
+                max_keepalive_connections=Config.SUPABASE_HTTP_MAX_KEEPALIVE,
+                keepalive_expiry=None,
+            ),
+        )
+        httpx_client = httpx.Client(
+            transport=transport,
+            timeout=httpx.Timeout(
+                connect=Config.SUPABASE_HTTP_CONNECT_TIMEOUT,
+                read=Config.SUPABASE_HTTP_READ_TIMEOUT,
+                write=Config.SUPABASE_HTTP_WRITE_TIMEOUT,
+                pool=Config.SUPABASE_HTTP_POOL_TIMEOUT,
+            ),
+        )
+        options = ClientOptions(httpx_client=httpx_client)
+        client = create_client(Config.SUPABASE_URL, Config.SUPABASE_SECRET_KEY, options=options)
+    except Exception:
+        client = create_client(Config.SUPABASE_URL, Config.SUPABASE_SECRET_KEY)
+
+    app.supabase_client = client
+    print("✅ Supabase client initialized")
+
 
 def init_websocket(app):
-    """Initialize WebSocket support for ConversationRelay"""
     app.sock = Sock(app)
     print("✅ WebSocket support initialized for ConversationRelay")
 
+
 def init_twilio(app):
-    """Initialize Twilio client with validation"""
-    if Config.TWILIO_ACCOUNT_SID and Config.TWILIO_AUTH_TOKEN:
-        try:
-            app.twilio_client = Client(Config.TWILIO_ACCOUNT_SID, Config.TWILIO_AUTH_TOKEN)
-            # Test the client by fetching account info
-            account = app.twilio_client.api.accounts(Config.TWILIO_ACCOUNT_SID).fetch()
-            print(f"✅ Twilio client initialized successfully (Account: {account.friendly_name})")
-        except Exception as e:
-            print(f"⚠️  Twilio client initialization failed: {e}")
-            app.twilio_client = None
-    else:
+    if not Config.TWILIO_ACCOUNT_SID or not Config.TWILIO_AUTH_TOKEN:
+        app.twilio_client = None
         print("⚠️  Twilio credentials not configured - voice features disabled")
+        return
+
+    try:
+        app.twilio_client = TwilioClient(Config.TWILIO_ACCOUNT_SID, Config.TWILIO_AUTH_TOKEN)
+        account = app.twilio_client.api.accounts(Config.TWILIO_ACCOUNT_SID).fetch()
+        print(f"✅ Twilio client initialized (Account: {account.friendly_name})")
+    except Exception as e:
+        print(f"⚠️  Twilio client initialization failed: {e}")
         app.twilio_client = None
 
-# def init_mcp_server(app):
-#     "Initialize mcp server"
-#     if Config.MCP_SERVER_URL and Config.MCP_API_KEY:
-#         transport = StreamableHttpTransport(
-#                     Config.MCP_SERVER_URL,
-#                     headers={"Authorization": f"Bearer {Config.MCP_API_KEY}"})
-#         app.mcp_client = Client(transport=transport)
-#     else:
-#         print("⚠️  MCP Server url or MCP api key not found")
-#         app.mcp_client=None
 
+def register_blueprints(app):
+    from blueprints.auth import auth_bp
+    from blueprints.tenant import tenant_bp
+    from blueprints.voice_agent import voice_agent_bp, register_websocket
+    from blueprints.twilio_phone_numbers import twilio_bp
+    from blueprints.integrations_google_calendar import google_calendar_integration_bp
+    from blueprints.integrations_hubspot import hubspot_integration_bp
+
+    app.register_blueprint(auth_bp, url_prefix="/auth")
+    app.register_blueprint(tenant_bp, url_prefix="/tenant")
+    app.register_blueprint(voice_agent_bp, url_prefix="/voice-agent")
+    app.register_blueprint(twilio_bp, url_prefix="/twilio")
+    app.register_blueprint(google_calendar_integration_bp, url_prefix="/integrations/google-calendar")
+    app.register_blueprint(hubspot_integration_bp, url_prefix="/integrations/hubspot")
+
+    register_websocket(app)
+    print("✅ Blueprints registered")
+
+
+def init_app(app):
+    init_openai(app)
+    init_supabase(app)
+    init_websocket(app)
+    init_twilio(app)
+    register_blueprints(app)

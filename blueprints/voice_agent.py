@@ -5,6 +5,7 @@ Uses only Config.TWILIO_PHONE_NUMBER (no tenant lookup).
 """
 import copy
 import json
+import re
 import threading
 import time
 import traceback
@@ -31,6 +32,8 @@ voice_agent_bp = Blueprint("voice_agent", __name__)
 active_conversations = {}
 recording_started_calls = set()
 recording_lock = threading.Lock()
+
+_VOICE_CREDENTIAL_REFRESH_SECONDS = 300
 
 
 def _normalize_phone(phone):
@@ -142,7 +145,7 @@ def _resolve_tenant_id_for_call_sid(call_sid):
 
 
 def _get_tenant_agent_config(tenant_id):
-    """Load tenant-specific voice agent configuration."""
+    """Load tenant-specific voice agent configuration, including industry from the tenants table."""
     supabase = getattr(current_app, "supabase_client", None)
     if not supabase or not tenant_id:
         return {}
@@ -154,8 +157,20 @@ def _get_tenant_agent_config(tenant_id):
             .limit(1)
             .execute()
         )
-        if row.data and len(row.data) > 0:
-            return row.data[0] or {}
+        config = dict(row.data[0]) if row.data else {}
+        try:
+            tenant_row = (
+                supabase.table("tenants")
+                .select("industry")
+                .eq("id", tenant_id)
+                .limit(1)
+                .execute()
+            )
+            if tenant_row.data:
+                config["industry"] = tenant_row.data[0].get("industry") or None
+        except Exception:
+            pass
+        return config
     except Exception as e:
         print(f"[TenantConfig] Failed loading tenant config for {tenant_id}: {e}")
     return {}
@@ -165,6 +180,18 @@ def _build_system_prompt_for_tenant(tenant_config):
     """Build final system prompt from tenant override or global default, plus tone/custom_prompts."""
     tenant_override = ((tenant_config or {}).get("system_prompt") or "").strip()
     final_prompt = tenant_override if tenant_override else (system_prompt or "").strip()
+
+    industry = ((tenant_config or {}).get("industry") or "").strip()
+    if industry:
+        final_prompt += (
+            f"\n\nIMPORTANT: This assistant exclusively serves the {industry} industry. "
+            f"You MUST only answer questions that are relevant to {industry}. "
+            f"If the caller asks about anything outside of {industry}, politely decline and redirect: "
+            f"say something like 'I'm specialized for {industry} and unfortunately can't help with that. "
+            f"Is there anything {industry}-related I can assist you with?' "
+            "Do not make exceptions to this rule under any circumstances."
+        )
+
     tone = (tenant_config or {}).get("tone")
     if tone:
         final_prompt += f"\n\nTenant tone requirement: Use a {tone} tone consistently."
@@ -285,6 +312,26 @@ def _voice_end_call_openai_tool():
     }
 
 
+def _warmup_openai_async(app):
+    """Pre-warm the OpenAI HTTP connection during greeting playback so the first real query is fast."""
+    def run():
+        with app.app_context():
+            try:
+                client = getattr(app, "openai_client", None)
+                if not client:
+                    return
+                model = Config.OPENAI_VOICE_FAST_MODEL or Config.OPENAI_MODEL
+                client.chat.completions.create(
+                    model=model,
+                    messages=[{"role": "user", "content": "."}],
+                    max_tokens=1,
+                    temperature=0,
+                )
+            except Exception:
+                pass
+    threading.Thread(target=run, daemon=True).start()
+
+
 def _hangup_twilio_call(call_sid):
     """Terminate an in-progress Twilio call (parent leg)."""
     if not call_sid:
@@ -298,6 +345,50 @@ def _hangup_twilio_call(call_sid):
         print(f"[Hangup] CallSid={call_sid} status set to completed")
     except Exception as exc:
         print(f"[Hangup] Failed for CallSid={call_sid}: {exc}")
+
+
+def _drain_tool_cycle_user_prompts(ws, max_duration_ms=None):
+    """
+    After a calendar/CRM tool round, discard user speech that was captured while
+    the assistant was still checking (avoids double-processing barged-in audio).
+    Returns 'stop' if the session ended, otherwise None.
+    """
+    ms = float(
+        max_duration_ms
+        if max_duration_ms is not None
+        else getattr(Config, "VOICE_POST_TOOL_DRAIN_MS", None)
+        or 750
+    )
+    deadline = time.monotonic() + max(ms, 0) / 1000.0
+    consecutive_empty = 0
+    while time.monotonic() < deadline:
+        try:
+            raw = ws.receive(timeout=0.05)
+        except Exception as exc:
+            if "timeout" in str(exc).lower():
+                consecutive_empty += 1
+                if consecutive_empty >= 4:
+                    break
+                continue
+            break
+        if not raw:
+            consecutive_empty += 1
+            if consecutive_empty >= 4:
+                break
+            continue
+        consecutive_empty = 0
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        event_type = data.get("event") or data.get("type")
+        if event_type in {"stop", "error"}:
+            return "stop"
+        if event_type in {"media", "prompt", "input"}:
+            print(f"[ConversationRelay] Dropping buffered user input after tool wait: {data}")
+            continue
+        print(f"[ConversationRelay] Ignoring non-user event during post-tool drain: {event_type}")
+    return None
 
 
 def _init_voice_session_state(tenant_id, tenant_config, call_sid):
@@ -319,6 +410,8 @@ def _init_voice_session_state(tenant_id, tenant_config, call_sid):
         suffix_parts.append(
             "\n\nThis company has connected Google Calendar for this assistant. "
             "Use the provided tools to list events, check availability, create events, or quick-add events. "
+            "To create or update a calendar event you MUST call the appropriate tool in this turn; "
+            "never claim an event was created, updated, or deleted until a tool returns success. "
             "Never tell the caller you cannot access Calendar if the tools succeed. "
             "For new events, confirm title, date, start/end time (or duration), and timezone when unclear. "
             "Keep replies short and natural for a phone call."
@@ -341,8 +434,10 @@ def _init_voice_session_state(tenant_id, tenant_config, call_sid):
         "messages": [{"role": "system", "content": tenant_system_prompt + suffix}],
         "call_sid": call_sid,
         "tenant_id": tenant_id,
+        "tenant_config": tenant_config,
         "credentials_json": cred_json,
         "hubspot_access_token": hubspot_token,
+        "integration_last_refresh_ts": time.time(),
     }
 
 
@@ -746,6 +841,8 @@ def register_websocket(app):
                             tenant_id, tenant_config, call_sid
                         )
                         print(f"[ConversationRelay] Session started session_id={session_id} call_sid={call_sid}")
+                        # Pre-warm OpenAI connection while greeting plays so first user query is fast.
+                        _warmup_openai_async(current_app._get_current_object())
                         # Some Twilio number configurations only send "completed" status callback.
                         # Start recording from ConversationRelay setup to avoid missing recordings.
                         if call_sid:
@@ -771,31 +868,92 @@ def register_websocket(app):
 
                     messages = active_conversations[session_id]["messages"]
                     messages.append({"role": "user", "content": transcript})
-                    # Refresh OAuth blob each turn (token refresh + newly connected calendar).
+
                     tid = active_conversations[session_id].get("tenant_id")
-                    supabase = getattr(current_app, "supabase_client", None)
                     cred_json = active_conversations[session_id].get("credentials_json")
                     hubspot_token = active_conversations[session_id].get("hubspot_access_token")
-                    if tid and supabase:
-                        cfg = _get_tenant_agent_config(tid)
-                        if tenant_may_use_calendar_tools(cfg.get("allowed_actions")):
-                            cred_json = load_credentials_json_for_tenant(supabase, tid)
-                            active_conversations[session_id]["credentials_json"] = cred_json
-                        if tenant_may_use_hubspot_tools(cfg.get("allowed_actions")):
-                            hubspot_token = load_hubspot_access_token_for_tenant(supabase, tid)
-                            active_conversations[session_id]["hubspot_access_token"] = hubspot_token
+                    tenant_cfg = active_conversations[session_id].get("tenant_config") or {}
+                    allowed_actions = tenant_cfg.get("allowed_actions")
+
+                    tools_enabled = bool(
+                        (cred_json and tenant_may_use_calendar_tools(allowed_actions))
+                        or (hubspot_token and tenant_may_use_hubspot_tools(allowed_actions))
+                    )
+                    needs_tools = _voice_may_use_tools(messages, transcript)
+                    wants_tools = tools_enabled and needs_tools
+
+                    # If tools are needed but not connected, reply immediately without calling OpenAI.
+                    if needs_tools and not tools_enabled:
+                        not_connected_msg = _tools_not_connected_message(
+                            transcript, bool(cred_json), bool(hubspot_token)
+                        )
+                        if not_connected_msg:
+                            messages.append({"role": "assistant", "content": not_connected_msg})
+                            ws.send(json.dumps({"type": "text", "token": not_connected_msg, "last": True}))
+                            print(f"[ConversationRelay] Tools not connected reply: {not_connected_msg}")
+                            continue
+
+                    # Refresh integration secrets occasionally (not every turn).
+                    if tools_enabled and wants_tools:
+                        now = time.time()
+                        last = float(active_conversations[session_id].get("integration_last_refresh_ts") or 0)
+                        if (now - last) >= _VOICE_CREDENTIAL_REFRESH_SECONDS:
+                            supabase = getattr(current_app, "supabase_client", None)
+                            if tid and supabase:
+                                if tenant_may_use_calendar_tools(allowed_actions):
+                                    cred_json = load_credentials_json_for_tenant(supabase, tid)
+                                    active_conversations[session_id]["credentials_json"] = cred_json
+                                if tenant_may_use_hubspot_tools(allowed_actions):
+                                    hubspot_token = load_hubspot_access_token_for_tenant(supabase, tid)
+                                    active_conversations[session_id]["hubspot_access_token"] = hubspot_token
+                                active_conversations[session_id]["integration_last_refresh_ts"] = now
+
                     hangup_state = {"requested": False}
+                    is_goodbye = _voice_is_likely_goodbye(transcript)
+
+                    # If we expect tool usage / longer reasoning, speak immediately to reduce perceived latency.
+                    if wants_tools:
+                        try:
+                            ws.send(
+                                json.dumps(
+                                    {
+                                        "type": "text",
+                                        "token": (Config.VOICE_WAIT_MESSAGE or "One moment while I check that.").strip(),
+                                        "last": True,
+                                        # Caller cannot interrupt this line; following assistant text can preempt it.
+                                        "interruptible": False,
+                                        "preemptible": True,
+                                    }
+                                )
+                            )
+                        except Exception:
+                            pass
+
                     ai_response = get_openai_response(
                         messages,
-                        credentials_json=cred_json,
-                        hubspot_access_token=hubspot_token,
+                        credentials_json=cred_json if wants_tools else None,
+                        hubspot_access_token=hubspot_token if wants_tools else None,
                         hangup_state=hangup_state,
+                        include_end_call=wants_tools or is_goodbye,
                     )
                     messages.append({"role": "assistant", "content": ai_response})
 
                     # ConversationRelay output format (text token).
                     ws.send(json.dumps({"type": "text", "token": ai_response, "last": True}))
                     print(f"[ConversationRelay] Sent assistant text token: {ai_response}")
+
+                    if wants_tools:
+                        drain_outcome = _drain_tool_cycle_user_prompts(ws)
+                        if drain_outcome == "stop":
+                            if session_id and session_id in active_conversations:
+                                call_sid_stop = active_conversations[session_id].get("call_sid")
+                                if call_sid_stop:
+                                    print(
+                                        f"[Recording] WebSocket stop during post-tool drain. "
+                                        f"Triggering recording poll for call {call_sid_stop}"
+                                    )
+                                    _fetch_and_store_recording_async(call_sid_stop)
+                            break
 
                     if hangup_state.get("requested"):
                         hangup_call_sid = active_conversations[session_id].get("call_sid")
@@ -830,6 +988,7 @@ def get_openai_response(
     credentials_json=None,
     hubspot_access_token=None,
     hangup_state=None,
+    include_end_call=True,
 ):
     try:
         openai_client = current_app.openai_client
@@ -843,28 +1002,47 @@ def get_openai_response(
         if hubspot_access_token:
             hub_defs, hub_by_name = _voice_hubspot_tool_defs_and_map()
 
-        tools_defs = [_voice_end_call_openai_tool()]
+        tools_defs = []
+        if include_end_call:
+            tools_defs.append(_voice_end_call_openai_tool())
         if cal_defs:
-            tools_defs = tools_defs + list(cal_defs)
+            tools_defs.extend(cal_defs)
         if hub_defs:
-            tools_defs = tools_defs + list(hub_defs)
+            tools_defs.extend(hub_defs)
 
+        has_integration_tools = bool(cal_defs or hub_defs)
+        use_tools_api = bool(tools_defs)
         msgs = [dict(m) for m in messages]
-        max_rounds = 5
+        max_rounds = int(getattr(Config, "VOICE_TOOL_MAX_ROUNDS", None) or 3) if use_tools_api else 1
         for _ in range(max_rounds):
+            if has_integration_tools:
+                model_name = Config.OPENAI_MODEL
+                temperature = 0.5
+                max_tokens = int(
+                    getattr(Config, "VOICE_TOOL_MAX_TOKENS", None) or (900 if len(tools_defs) > 6 else 700)
+                )
+                timeout_s = float(getattr(Config, "VOICE_TOOL_TIMEOUT_SECONDS", None) or 18)
+            else:
+                model_name = Config.OPENAI_VOICE_FAST_MODEL or Config.OPENAI_MODEL
+                temperature = 0.4
+                max_tokens = int(getattr(Config, "VOICE_FAST_MAX_TOKENS", None) or 350)
+                timeout_s = float(getattr(Config, "VOICE_FAST_TIMEOUT_SECONDS", None) or 8)
+
             create_kwargs = {
-                "model": Config.OPENAI_MODEL,
+                "model": model_name,
                 "messages": msgs,
-                "temperature": 0.5,
-                "tools": tools_defs,
-                "tool_choice": "auto",
-                "max_tokens": 1100 if len(tools_defs) > 6 else 900,
+                "temperature": temperature,
+                "max_tokens": max_tokens,
+                "timeout": timeout_s,
             }
+            if use_tools_api:
+                create_kwargs["tools"] = tools_defs
+                create_kwargs["tool_choice"] = "auto"
 
             response = openai_client.chat.completions.create(**create_kwargs)
             msg = response.choices[0].message
 
-            if not msg.tool_calls:
+            if not use_tools_api or not msg.tool_calls:
                 return (msg.content or "").strip() or "Could you repeat that, please?"
 
             assistant_payload = {
@@ -940,6 +1118,246 @@ def get_openai_response(
         print(f"OpenAI response error: {exc}")
         traceback.print_exc()
         return "I am having trouble right now. Please try again."
+
+
+def _voice_transcript_may_need_tools(transcript: str) -> bool:
+    """
+    Heuristic: only enable tool-calling when the caller likely wants calendar/CRM actions.
+    Keeps normal chit-chat low latency.
+    """
+    t = (transcript or "").strip().lower()
+    if not t:
+        return False
+
+    # Strong calendar intent.
+    calendar_terms = [
+        "calendar",
+        "schedule",
+        "book",
+        "booking",
+        "appointment",
+        "meeting",
+        "reminder",
+        "event",
+        "invite",
+        "availability",
+        "free",
+        "busy",
+        "reschedule",
+        "cancel",
+        "timezone",
+        "time zone",
+        "tomorrow",
+        "next week",
+        "next monday",
+        "today",
+    ]
+    # Strong CRM intent.
+    hubspot_terms = [
+        "hubspot",
+        "crm",
+        "contact",
+        "lead",
+        "company",
+        "ticket",
+        "case",
+        "deal",
+        "pipeline",
+        "note",
+        "log this",
+        "create a ticket",
+        "update",
+        "search",
+        "look up",
+        "find",
+    ]
+
+    # If caller asks a straightforward question, prefer fast path.
+    fast_chat_terms = [
+        "what is",
+        "explain",
+        "how do i",
+        "help me understand",
+        "tell me about",
+        "who are you",
+    ]
+
+    if any(x in t for x in fast_chat_terms) and not any(x in t for x in (calendar_terms + hubspot_terms)):
+        return False
+
+    if any(x in t for x in calendar_terms):
+        return True
+    if any(x in t for x in hubspot_terms):
+        return True
+
+    # Numbers + dates often imply scheduling/logging.
+    if any(ch.isdigit() for ch in t) and any(
+        x in t for x in ["am", "pm", ":", "/", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
+    ):
+        return True
+    if re.search(
+        r"\b(january|february|march|april|june|july|august|september|october|november|december|"
+        r"jan|feb|mar|apr|jun|jul|aug|sep|oct|nov|dec)\b",
+        t,
+        re.I,
+    ):
+        return True
+    # "May" as a month (avoid matching modal "may I" by requiring a day or year nearby).
+    if re.search(r"\b\d{1,2}\s+may\b|\bmay\s+\d{1,2}\b|\b20\d{2}\b.*\bmay\b|\bmay\b.*\b20\d{2}\b", t, re.I):
+        return True
+    if re.search(r"\b20\d{2}\b", t):
+        return True
+
+    return False
+
+
+def _voice_thread_suggests_tools(messages: list, latest_user: str) -> bool:
+    """
+    Enable tools when the latest line is a short follow-up (confirmations, timezone, etc.)
+    but earlier turns already started a calendar/CRM flow. Avoids the fast path claiming success
+    without calling tools.
+    """
+    lu = (latest_user or "").strip().lower()
+    if not lu:
+        return False
+
+    combined = ""
+    for m in messages[-14:]:
+        c = (m.get("content") or "").strip()
+        if c:
+            combined += " " + c.lower()
+
+    thread_markers = (
+        "calendar",
+        "schedule",
+        "reminder",
+        "appointment",
+        "meeting",
+        "event",
+        "book",
+        "booking",
+        "timezone",
+        "time zone",
+        "availability",
+        "invite",
+        "reschedule",
+        "cancel",
+        "hubspot",
+        "crm",
+        "contact",
+        "ticket",
+        "deal",
+        "free busy",
+    )
+    if not any(tm in combined for tm in thread_markers):
+        return False
+
+    if re.match(
+        r"^\s*(yes|yeah|yep|sure|ok|okay|correct|right|please|proceed|confirmed?|go ahead|do it|please do|sounds good|that'?s right|that is right|agreed)\b",
+        lu,
+        re.I,
+    ):
+        return True
+    if re.search(r"\b(confirmed|proceed)\s*$", lu, re.I):
+        return True
+
+    if any(
+        x in lu
+        for x in (
+            "pakistan",
+            "karachi",
+            "lahore",
+            "india",
+            "dubai",
+            "tokyo",
+            "london",
+            "gmt",
+            "utc",
+            "est",
+            "pst",
+            "cet",
+            "asia/",
+        )
+    ):
+        return True
+
+    if re.search(r"\b\d{1,2}\s*(:\d{2})?\s*(am|pm)\b", lu, re.I):
+        return True
+    if re.search(r"\b20\d{2}\b", lu):
+        return True
+
+    if any(
+        x in lu
+        for x in (
+            "can't see",
+            "cannot see",
+            "dont see",
+            "don't see",
+            "didn't work",
+            "not there",
+            "no event",
+            "create again",
+            "try again",
+        )
+    ):
+        return True
+
+    return False
+
+
+def _voice_may_use_tools(messages: list, latest_user: str) -> bool:
+    return _voice_transcript_may_need_tools(latest_user) or _voice_thread_suggests_tools(
+        messages, latest_user
+    )
+
+
+_CALENDAR_KEYWORDS = frozenset([
+    "calendar", "schedule", "book", "booking", "appointment", "meeting",
+    "event", "availability", "available", "remind", "reschedule", "free slot",
+])
+_HUBSPOT_KEYWORDS = frozenset([
+    "hubspot", "crm", "contact", "lead", "company", "ticket", "deal",
+    "pipeline", "note", "log",
+])
+
+
+def _tools_not_connected_message(transcript: str, has_calendar: bool, has_hubspot: bool) -> str | None:
+    """
+    Return a spoken message when the caller clearly needs a tool that isn't connected.
+    Returns None when no specific missing tool can be identified (let OpenAI handle it).
+    """
+    t = transcript.lower()
+    wants_calendar = any(k in t for k in _CALENDAR_KEYWORDS)
+    wants_hubspot = any(k in t for k in _HUBSPOT_KEYWORDS)
+
+    missing = []
+    if wants_calendar and not has_calendar:
+        missing.append("Google Calendar")
+    if wants_hubspot and not has_hubspot:
+        missing.append("HubSpot CRM")
+
+    if not missing:
+        return None
+
+    names = " and ".join(missing)
+    verb = "hasn't" if len(missing) == 1 else "haven't"
+    return (
+        f"I'd like to help with that, but {names} {verb} been connected for this account yet. "
+        "Please ask your administrator to set it up in the portal."
+    )
+
+
+_GOODBYE_RE = re.compile(
+    r"\b(bye|goodbye|good\s*bye|see\s+you|talk\s+(?:to\s+you\s+)?later|"
+    r"that'?s\s+all|no\s+more\s+questions?|hang\s+up|end\s+(?:the\s+)?call|"
+    r"have\s+a\s+good|take\s+care|i'?m\s+done|we'?re\s+done|"
+    r"thanks?\s*bye|thank\s+you\s+bye|speak\s+(?:to\s+you\s+)?(?:soon|later))\b",
+    re.I,
+)
+
+
+def _voice_is_likely_goodbye(transcript: str) -> bool:
+    return bool(_GOODBYE_RE.search((transcript or "").strip()))
 
 
 @voice_agent_bp.route("/health", methods=["GET"])

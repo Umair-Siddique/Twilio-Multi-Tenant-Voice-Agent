@@ -15,6 +15,7 @@ from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
 from config import Config
 from utils.auth_utils import require_role, require_tenant
 from utils.credential_encryption import encrypt_json, encrypt_text
+from utils.supabase_retry import supabase_call_with_retry
 
 google_calendar_integration_bp = Blueprint("google_calendar_integration", __name__)
 
@@ -111,12 +112,14 @@ def _upsert_google_calendar_credentials(tenant_id: str, credentials) -> tuple[di
         raise ValueError("Supabase not configured")
 
     integration_lookup = (
-        supabase.table("integrations")
-        .select("id")
-        .eq("tenant_id", tenant_id)
-        .eq("type", "google_calendar")
-        .limit(1)
-        .execute()
+        supabase_call_with_retry(
+            lambda: supabase.table("integrations")
+            .select("id")
+            .eq("tenant_id", tenant_id)
+            .eq("type", "google_calendar")
+            .limit(1)
+            .execute()
+        )
     )
 
     integration_payload = {
@@ -131,15 +134,17 @@ def _upsert_google_calendar_credentials(tenant_id: str, credentials) -> tuple[di
 
     if integration_lookup.data and len(integration_lookup.data) > 0:
         integration_id = integration_lookup.data[0]["id"]
-        integration_result = (
-            supabase.table("integrations")
+        integration_result = supabase_call_with_retry(
+            lambda: supabase.table("integrations")
             .update(integration_payload)
             .eq("id", integration_id)
             .execute()
         )
         integration_row = integration_result.data[0]
     else:
-        integration_result = supabase.table("integrations").insert(integration_payload).execute()
+        integration_result = supabase_call_with_retry(
+            lambda: supabase.table("integrations").insert(integration_payload).execute()
+        )
         integration_row = integration_result.data[0]
         integration_id = integration_row["id"]
 
@@ -158,11 +163,13 @@ def _upsert_google_calendar_credentials(tenant_id: str, credentials) -> tuple[di
     expiry = credentials.expiry.isoformat() if credentials.expiry else None
 
     credentials_lookup = (
-        supabase.table("integration_credentials")
-        .select("id")
-        .eq("integration_id", integration_id)
-        .limit(1)
-        .execute()
+        supabase_call_with_retry(
+            lambda: supabase.table("integration_credentials")
+            .select("id")
+            .eq("integration_id", integration_id)
+            .limit(1)
+            .execute()
+        )
     )
 
     credentials_row_payload = {
@@ -174,16 +181,18 @@ def _upsert_google_calendar_credentials(tenant_id: str, credentials) -> tuple[di
     }
 
     if credentials_lookup.data and len(credentials_lookup.data) > 0:
-        credential_result = (
-            supabase.table("integration_credentials")
+        credential_result = supabase_call_with_retry(
+            lambda: supabase.table("integration_credentials")
             .update(credentials_row_payload)
             .eq("id", credentials_lookup.data[0]["id"])
             .execute()
         )
         credential_row = credential_result.data[0]
     else:
-        credential_result = (
-            supabase.table("integration_credentials").insert(credentials_row_payload).execute()
+        credential_result = supabase_call_with_retry(
+            lambda: supabase.table("integration_credentials")
+            .insert(credentials_row_payload)
+            .execute()
         )
         credential_row = credential_result.data[0]
 
@@ -347,12 +356,14 @@ def google_calendar_connection_status(user_id, tenant_id, role):
     """
     supabase = current_app.supabase_client
     row = (
-        supabase.table("integrations")
-        .select("id, type, status, connected_at, last_test_at, error_message, config")
-        .eq("tenant_id", tenant_id)
-        .eq("type", "google_calendar")
-        .limit(1)
-        .execute()
+        supabase_call_with_retry(
+            lambda: supabase.table("integrations")
+            .select("id, type, status, connected_at, last_test_at, error_message, config")
+            .eq("tenant_id", tenant_id)
+            .eq("type", "google_calendar")
+            .limit(1)
+            .execute()
+        )
     )
     integration = row.data[0] if row.data else None
 
@@ -376,25 +387,37 @@ def google_calendar_disconnect(user_id, tenant_id, role):
         return jsonify({"error": "Supabase not configured"}), 500
 
     integration_row = (
-        supabase.table("integrations")
-        .select("id")
-        .eq("tenant_id", tenant_id)
-        .eq("type", "google_calendar")
-        .limit(1)
-        .execute()
+        supabase_call_with_retry(
+            lambda: supabase.table("integrations")
+            .select("id")
+            .eq("tenant_id", tenant_id)
+            .eq("type", "google_calendar")
+            .limit(1)
+            .execute()
+        )
     )
     if not integration_row.data:
         return jsonify({"message": "Google Calendar integration already disconnected"}), 200
 
     integration_id = integration_row.data[0]["id"]
-    supabase.table("integration_credentials").delete().eq("integration_id", integration_id).execute()
-    supabase.table("integrations").update(
-        {
-            "status": "disconnected",
-            "error_message": None,
-            "config": {},
-        }
-    ).eq("id", integration_id).execute()
+    supabase_call_with_retry(
+        lambda: supabase.table("integration_credentials")
+        .delete()
+        .eq("integration_id", integration_id)
+        .execute()
+    )
+    supabase_call_with_retry(
+        lambda: supabase.table("integrations")
+        .update(
+            {
+                "status": "disconnected",
+                "error_message": None,
+                "config": {},
+            }
+        )
+        .eq("id", integration_id)
+        .execute()
+    )
 
     return jsonify({"message": "Google Calendar disconnected successfully"}), 200
 

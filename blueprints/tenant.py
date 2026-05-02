@@ -4,6 +4,7 @@ These demonstrate the auth flow and provide tenant configuration APIs
 """
 from flask import Blueprint, request, jsonify, current_app
 from utils.auth_utils import require_tenant, require_role
+from utils.supabase_retry import supabase_call_with_retry
 from functools import wraps
 import traceback
 
@@ -33,7 +34,9 @@ def get_tenant_profile(user_id, tenant_id, role):
     supabase = current_app.supabase_client
     
     # Get tenant details
-    tenant_response = supabase.table('tenants').select('*').eq('id', tenant_id).execute()
+    tenant_response = supabase_call_with_retry(
+        lambda: supabase.table("tenants").select("*").eq("id", tenant_id).execute()
+    )
     
     if not tenant_response.data or len(tenant_response.data) == 0:
         return jsonify({"error": "Tenant not found"}), 404
@@ -63,7 +66,9 @@ def update_tenant_profile(user_id, tenant_id, role):
         return jsonify({"error": "No valid fields to update"}), 400
     
     # Update tenant
-    response = supabase.table('tenants').update(update_data).eq('id', tenant_id).execute()
+    response = supabase_call_with_retry(
+        lambda: supabase.table("tenants").update(update_data).eq("id", tenant_id).execute()
+    )
     
     if not response.data or len(response.data) == 0:
         return jsonify({"error": "Failed to update tenant"}), 500
@@ -83,7 +88,12 @@ def get_agent_config(user_id, tenant_id, role):
     """
     supabase = current_app.supabase_client
     
-    response = supabase.table('tenant_agent_config').select('*').eq('tenant_id', tenant_id).execute()
+    response = supabase_call_with_retry(
+        lambda: supabase.table("tenant_agent_config")
+        .select("*")
+        .eq("tenant_id", tenant_id)
+        .execute()
+    )
     
     if not response.data or len(response.data) == 0:
         return jsonify({"error": "Agent config not found"}), 404
@@ -115,9 +125,12 @@ def update_agent_config(user_id, tenant_id, role):
         return jsonify({"error": "No valid fields to update"}), 400
     
     # Update agent config
-    response = supabase.table('tenant_agent_config').update(
-        update_data
-    ).eq('tenant_id', tenant_id).execute()
+    response = supabase_call_with_retry(
+        lambda: supabase.table("tenant_agent_config")
+        .update(update_data)
+        .eq("tenant_id", tenant_id)
+        .execute()
+    )
     
     if not response.data or len(response.data) == 0:
         return jsonify({"error": "Failed to update agent config"}), 500
@@ -137,7 +150,9 @@ def get_phone_numbers(user_id, tenant_id, role):
     """
     supabase = current_app.supabase_client
     
-    response = supabase.table('phone_numbers').select('*').eq('tenant_id', tenant_id).execute()
+    response = supabase_call_with_retry(
+        lambda: supabase.table("phone_numbers").select("*").eq("tenant_id", tenant_id).execute()
+    )
     
     return jsonify({
         "phone_numbers": response.data
@@ -154,9 +169,12 @@ def get_tenant_users(user_id, tenant_id, role):
     supabase = current_app.supabase_client
     
     # Get tenant users with auth user details
-    response = supabase.table('tenant_users').select(
-        'id, user_id, role, created_at'
-    ).eq('tenant_id', tenant_id).execute()
+    response = supabase_call_with_retry(
+        lambda: supabase.table("tenant_users")
+        .select("id, user_id, role, created_at")
+        .eq("tenant_id", tenant_id)
+        .execute()
+    )
     
     return jsonify({
         "users": response.data
@@ -185,9 +203,13 @@ def invite_user(user_id, tenant_id, role):
     supabase = current_app.supabase_client
     
     # Check if user already exists in tenant
-    existing = supabase.table('tenant_users').select('id').eq(
-        'tenant_id', tenant_id
-    ).eq('user_id', data['user_id']).execute()
+    existing = supabase_call_with_retry(
+        lambda: supabase.table("tenant_users")
+        .select("id")
+        .eq("tenant_id", tenant_id)
+        .eq("user_id", data["user_id"])
+        .execute()
+    )
     
     if existing.data and len(existing.data) > 0:
         return jsonify({"error": "User already exists in this tenant"}), 400
@@ -199,7 +221,9 @@ def invite_user(user_id, tenant_id, role):
         "role": data['role']
     }
     
-    response = supabase.table('tenant_users').insert(tenant_user_data).execute()
+    response = supabase_call_with_retry(
+        lambda: supabase.table("tenant_users").insert(tenant_user_data).execute()
+    )
     
     if not response.data or len(response.data) == 0:
         return jsonify({"error": "Failed to add user to tenant"}), 500

@@ -3,6 +3,7 @@ Utility functions and middleware for authentication and tenant management
 """
 from flask import request, jsonify, current_app
 from functools import wraps
+from utils.supabase_retry import supabase_call_with_retry
 
 
 def get_supabase_client():
@@ -40,10 +41,13 @@ def get_tenant_from_user(user_id):
         supabase = get_supabase_client()
         if not supabase:
             return None, None, "Supabase not configured"
-        
-        response = supabase.table('tenant_users').select(
-            'tenant_id, role'
-        ).eq('user_id', user_id).execute()
+
+        response = supabase_call_with_retry(
+            lambda: supabase.table("tenant_users")
+            .select("tenant_id, role")
+            .eq("user_id", user_id)
+            .execute()
+        )
         
         if not response.data or len(response.data) == 0:
             return None, None, "User not associated with any tenant"
@@ -162,10 +166,14 @@ def get_tenant_from_phone(phone_number):
         supabase = get_supabase_client()
         if not supabase:
             return None, "Supabase not configured"
-        
-        response = supabase.table('phone_numbers').select(
-            'tenant_id'
-        ).eq('phone_number', phone_number).eq('status', 'active').execute()
+
+        response = supabase_call_with_retry(
+            lambda: supabase.table("phone_numbers")
+            .select("tenant_id")
+            .eq("phone_number", phone_number)
+            .eq("status", "active")
+            .execute()
+        )
         
         if not response.data or len(response.data) == 0:
             return None, f"No active tenant found for phone number: {phone_number}"
