@@ -87,3 +87,6 @@ class Config:
 
     # ── Credential encryption ─────────────────────────────────────────────────
     CREDENTIAL_ENCRYPTION_KEY = os.getenv("CREDENTIAL_ENCRYPTION_KEY")
+
+    # ── Voice agent concurrency ───────────────────────────────────────────────
+    MAX_CONCURRENT_SESSIONS = int(os.getenv("MAX_CONCURRENT_SESSIONS", "100"))

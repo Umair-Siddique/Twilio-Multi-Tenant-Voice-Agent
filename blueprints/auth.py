@@ -371,25 +371,34 @@ def signin():
             return jsonify({"error": "Invalid email or password"}), 401
         return jsonify({"error": f"Authentication error: {error_msg}"}), 401
     
+    # Check if user is a super admin
+    is_super_admin = False
+    try:
+        sa_response = supabase.table('super_admins').select('id').eq('user_id', user_id).execute()
+        is_super_admin = bool(sa_response.data)
+    except Exception as e:
+        print(f"[WARN] super_admins check failed for {user_id}: {e}")
+
     # Get user's tenant information
     try:
         tenant_user_response = supabase.table('tenant_users').select(
             'tenant_id, role, tenants(*)'
         ).eq('user_id', user_id).execute()
-        
+
         if not tenant_user_response.data or len(tenant_user_response.data) == 0:
             return jsonify({
                 "error": "User not associated with any tenant. Please contact support."
             }), 404
-        
+
         # User might belong to multiple tenants, return the first one (primary)
         tenant_info = tenant_user_response.data[0]
-        
+
         return jsonify({
             "message": "Sign in successful",
             "user": {
                 "id": user_id,
-                "email": auth_response.user.email
+                "email": auth_response.user.email,
+                "is_super_admin": is_super_admin
             },
             "tenant": {
                 "id": tenant_info['tenant_id'],
@@ -405,7 +414,7 @@ def signin():
                 "expires_at": auth_response.session.expires_at
             }
         }), 200
-        
+
     except Exception as e:
         return jsonify({"error": f"Failed to fetch tenant info: {str(e)}"}), 500
 
@@ -778,23 +787,32 @@ def get_current_user():
             return jsonify({"error": "Invalid token"}), 401
         
         user_id = user_response.user.id
-        
+
+        # Check super admin status
+        is_super_admin = False
+        try:
+            sa_response = supabase.table('super_admins').select('id').eq('user_id', user_id).execute()
+            is_super_admin = bool(sa_response.data)
+        except Exception as e:
+            print(f"[WARN] super_admins check failed for {user_id}: {e}")
+
         # Get tenant information
         tenant_user_response = supabase.table('tenant_users').select(
             'tenant_id, role, tenants(*)'
         ).eq('user_id', user_id).execute()
-        
+
         if not tenant_user_response.data or len(tenant_user_response.data) == 0:
             return jsonify({
                 "error": "User not associated with any tenant"
             }), 404
-        
+
         tenant_info = tenant_user_response.data[0]
-        
+
         return jsonify({
             "user": {
                 "id": user_id,
-                "email": user_response.user.email
+                "email": user_response.user.email,
+                "is_super_admin": is_super_admin
             },
             "tenant": {
                 "id": tenant_info['tenant_id'],

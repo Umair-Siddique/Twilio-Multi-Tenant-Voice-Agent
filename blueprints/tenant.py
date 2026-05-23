@@ -2,11 +2,18 @@
 Tenant management endpoints
 These demonstrate the auth flow and provide tenant configuration APIs
 """
-from flask import Blueprint, request, jsonify, current_app
+from flask import Blueprint, request, jsonify, current_app, Response
 from utils.auth_utils import require_tenant, require_role
 from utils.supabase_retry import supabase_call_with_retry
+from utils.voice_catalog import AVAILABLE_VOICES, get_voice_by_id, get_default_voice, DEFAULT_VOICE_ID
 from functools import wraps
 import traceback
+
+_VOICE_PREVIEW_TEXT = (
+    "Hello! I'm your AI voice assistant. I'm here to help you with any questions "
+    "or requests you may have. How can I assist you today?"
+)
+_VOICE_PUBLIC_FIELDS = ["id", "name", "gender", "language_code", "provider", "description"]
 
 tenant_bp = Blueprint('tenant', __name__)
 
@@ -232,6 +239,120 @@ def invite_user(user_id, tenant_id, role):
         "message": "User added to tenant successfully",
         "tenant_user": response.data[0]
     }), 201
+
+
+@tenant_bp.route('/voices', methods=['GET'])
+@require_tenant
+@handle_errors
+def list_voices(user_id, tenant_id, role):
+    """
+    List all available AI voices that the tenant can select.
+    """
+    voices = [{k: v[k] for k in _VOICE_PUBLIC_FIELDS} for v in AVAILABLE_VOICES]
+    return jsonify({"voices": voices}), 200
+
+
+@tenant_bp.route('/voices/<voice_id>/preview', methods=['GET'])
+@require_tenant
+@handle_errors
+def preview_voice(user_id, tenant_id, role, voice_id):
+    """
+    Stream an audio preview of the requested voice.
+    Uses OpenAI TTS as an approximation — the live call uses Twilio TTS.
+    """
+    voice = get_voice_by_id(voice_id)
+    if not voice:
+        return jsonify({"error": "Voice not found"}), 404
+
+    openai_client = current_app.openai_client
+    try:
+        tts_response = openai_client.audio.speech.create(
+            model="tts-1",
+            voice=voice["openai_preview_voice"],
+            input=_VOICE_PREVIEW_TEXT,
+            response_format="mp3",
+        )
+    except Exception as e:
+        status_code = getattr(e, "status_code", None)
+        if status_code == 429 or "insufficient_quota" in str(e):
+            return jsonify({
+                "error": "Voice preview unavailable — OpenAI TTS quota exceeded. Please top up your OpenAI account."
+            }), 503
+        raise
+
+    return Response(
+        tts_response.content,
+        mimetype="audio/mpeg",
+        headers={
+            "Content-Disposition": f'inline; filename="{voice_id}-preview.mp3"',
+            "Cache-Control": "public, max-age=3600",
+        },
+    )
+
+
+@tenant_bp.route('/voice-selection', methods=['GET'])
+@require_tenant
+@handle_errors
+def get_voice_selection(user_id, tenant_id, role):
+    """
+    Return the tenant's current voice selection with full metadata.
+    Falls back to the default voice if none has been set.
+    """
+    supabase = current_app.supabase_client
+
+    response = supabase_call_with_retry(
+        lambda: supabase.table("tenant_agent_config")
+        .select("voice_id")
+        .eq("tenant_id", tenant_id)
+        .execute()
+    )
+
+    voice_id = None
+    if response.data and len(response.data) > 0:
+        voice_id = response.data[0].get("voice_id")
+
+    voice = get_voice_by_id(voice_id) if voice_id else None
+    if not voice:
+        voice = get_default_voice()
+
+    return jsonify({"voice": {k: voice[k] for k in _VOICE_PUBLIC_FIELDS}}), 200
+
+
+@tenant_bp.route('/voice-selection', methods=['PUT'])
+@require_role(['owner', 'admin'])
+@handle_errors
+def set_voice_selection(user_id, tenant_id, role):
+    """
+    Set the tenant's AI agent voice.
+    Requires owner or admin role.
+    Body: { "voice_id": "<id from GET /tenant/voices>" }
+    """
+    data = request.get_json() or {}
+    voice_id = data.get("voice_id")
+
+    if not voice_id:
+        return jsonify({"error": "voice_id is required"}), 400
+
+    voice = get_voice_by_id(voice_id)
+    if not voice:
+        return jsonify({"error": f"Invalid voice_id '{voice_id}'. Use GET /tenant/voices for valid options."}), 400
+
+    supabase = current_app.supabase_client
+
+    response = supabase_call_with_retry(
+        lambda: supabase.table("tenant_agent_config")
+        .update({"voice_id": voice_id})
+        .eq("tenant_id", tenant_id)
+        .execute()
+    )
+
+    if not response.data or len(response.data) == 0:
+        return jsonify({"error": "Failed to update voice selection"}), 500
+
+    return jsonify({
+        "message": "Voice updated successfully",
+        "voice": {k: voice[k] for k in _VOICE_PUBLIC_FIELDS},
+    }), 200
 
 
 @tenant_bp.route('/health', methods=['GET'])

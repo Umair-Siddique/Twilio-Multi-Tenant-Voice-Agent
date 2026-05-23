@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 
 import requests
 from flask import Blueprint, current_app, jsonify, request
+from twilio.request_validator import RequestValidator
 from twilio.twiml.voice_response import Connect, ConversationRelay, Language, VoiceResponse
 
 from config import Config
@@ -34,6 +35,10 @@ recording_started_calls = set()
 recording_lock = threading.Lock()
 
 _VOICE_CREDENTIAL_REFRESH_SECONDS = 300
+
+# Tenant config TTL cache — avoids a Supabase round-trip on every call turn.
+_tenant_config_cache: dict = {}  # {tenant_id: (config_dict, float_timestamp)}
+_TENANT_CONFIG_TTL_SECS = 60
 
 
 def _normalize_phone(phone):
@@ -95,6 +100,32 @@ def _resolve_base_http_url():
     return f"{scheme}://{request.host}"
 
 
+def _get_twilio_request_url() -> str:
+    """Reconstruct the public URL Twilio signed, honouring reverse-proxy headers."""
+    forwarded_proto = request.headers.get("X-Forwarded-Proto", "").strip()
+    forwarded_host  = request.headers.get("X-Forwarded-Host", "").strip()
+    if forwarded_proto and forwarded_host:
+        url = f"{forwarded_proto}://{forwarded_host}{request.path}"
+        if request.query_string:
+            url += f"?{request.query_string.decode('utf-8')}"
+        return url
+    return request.url
+
+
+def _is_valid_twilio_request() -> bool:
+    """
+    Validate the X-Twilio-Signature header.
+    Returns True when valid, or when TWILIO_AUTH_TOKEN is not set (dev/test mode).
+    """
+    if not Config.TWILIO_AUTH_TOKEN:
+        return True
+    validator = RequestValidator(Config.TWILIO_AUTH_TOKEN)
+    url       = _get_twilio_request_url()
+    post_data = request.form.to_dict() if request.method == "POST" else {}
+    signature = request.headers.get("X-Twilio-Signature", "")
+    return validator.validate(url, post_data, signature)
+
+
 def _resolve_tenant_id_for_number(to_number):
     """Resolve tenant_id from phone_numbers mapping using Twilio To number."""
     supabase = getattr(current_app, "supabase_client", None)
@@ -146,13 +177,19 @@ def _resolve_tenant_id_for_call_sid(call_sid):
 
 def _get_tenant_agent_config(tenant_id):
     """Load tenant-specific voice agent configuration, including industry from the tenants table."""
+    cached = _tenant_config_cache.get(tenant_id)
+    if cached:
+        config, cached_at = cached
+        if time.time() - cached_at < _TENANT_CONFIG_TTL_SECS:
+            return config
+
     supabase = getattr(current_app, "supabase_client", None)
     if not supabase or not tenant_id:
         return {}
     try:
         row = (
             supabase.table("tenant_agent_config")
-            .select("greeting, tone, system_prompt, custom_prompts, allowed_actions")
+            .select("greeting, tone, system_prompt, custom_prompts, allowed_actions, voice_id")
             .eq("tenant_id", tenant_id)
             .limit(1)
             .execute()
@@ -170,6 +207,7 @@ def _get_tenant_agent_config(tenant_id):
                 config["industry"] = tenant_row.data[0].get("industry") or None
         except Exception:
             pass
+        _tenant_config_cache[tenant_id] = (config, time.time())
         return config
     except Exception as e:
         print(f"[TenantConfig] Failed loading tenant config for {tenant_id}: {e}")
@@ -179,7 +217,15 @@ def _get_tenant_agent_config(tenant_id):
 def _build_system_prompt_for_tenant(tenant_config):
     """Build final system prompt from tenant override or global default, plus tone/custom_prompts."""
     tenant_override = ((tenant_config or {}).get("system_prompt") or "").strip()
-    final_prompt = tenant_override if tenant_override else (system_prompt or "").strip()
+    base_prompt = tenant_override if tenant_override else (system_prompt or "").strip()
+
+    # Prepend a language enforcement rule so the model always replies in the system prompt's language.
+    language_rule = (
+        "CRITICAL LANGUAGE RULE: You MUST always respond in the exact same language as this system prompt "
+        "and the welcome greeting — no exceptions. Even if the caller speaks a completely different language, "
+        "you MUST reply only in your configured language. Never switch languages under any circumstances."
+    )
+    final_prompt = language_rule + "\n\n" + base_prompt
 
     industry = ((tenant_config or {}).get("industry") or "").strip()
     if industry:
@@ -525,6 +571,10 @@ def handle_incoming_call():
     """
     Twilio webhook entrypoint. Only accepts calls to Config.TWILIO_PHONE_NUMBER.
     """
+    if not _is_valid_twilio_request():
+        print("[Security] /incoming-call rejected — invalid Twilio signature")
+        return "Forbidden", 403
+
     try:
         to_number = request.form.get("To")
         from_number = request.form.get("From", "")
@@ -554,13 +604,20 @@ def handle_incoming_call():
         tenant_config = _get_tenant_agent_config(tenant_id)
         greeting = tenant_config.get("greeting") or greeting_prompt
 
+        from utils.voice_catalog import get_voice_by_id, get_default_voice
+        voice = get_voice_by_id(tenant_config.get("voice_id")) or get_default_voice()
+
         connect = Connect()
         conversation_relay = ConversationRelay(
             url=ws_url,
             interruptible=True,
             welcome_greeting=greeting,
         )
-        conversation_relay.append(Language(code=Config.CONVERSATION_LANGUAGE or "en-US"))
+        conversation_relay.append(Language(
+            code=voice["language_code"],
+            tts_provider=voice["twilio_tts_provider"],
+            voice=voice["twilio_voice"],
+        ))
         connect.append(conversation_relay)
         response = VoiceResponse()
         response.append(connect)
@@ -582,6 +639,10 @@ def handle_call_status():
     Twilio status callback. Logs call lifecycle events.
     On completed calls, triggers a fallback recording poll + store flow.
     """
+    if not _is_valid_twilio_request():
+        print("[Security] /call-status rejected — invalid Twilio signature")
+        return "Forbidden", 403
+
     call_status = request.values.get("CallStatus")
     call_sid = request.values.get("CallSid")
     to_number = request.values.get("To")
@@ -621,6 +682,15 @@ def handle_call_status():
 
     # Fallback: when call completes, poll Twilio recordings and persist if available.
     if call_sid and (call_status or "").lower() == "completed":
+        # Free the in-memory recording guard so it doesn't grow unbounded.
+        with recording_lock:
+            recording_started_calls.discard(call_sid)
+        # Also evict cached tenant config for this call's number (stale after call ends).
+        to_number = request.values.get("To")
+        if to_number:
+            tenant_id = _resolve_tenant_id_for_number(to_number)
+            if tenant_id:
+                _tenant_config_cache.pop(tenant_id, None)
         try:
             _fetch_and_store_recording_async(call_sid)
         except Exception as e:
@@ -787,6 +857,10 @@ def handle_recording_status():
     """
     Twilio recording status callback. Download recording and upload to Supabase.
     """
+    if not _is_valid_twilio_request():
+        print("[Security] /recording-status rejected — invalid Twilio signature")
+        return "Forbidden", 403
+
     try:
         call_sid = request.values.get("CallSid")
         recording_sid = request.values.get("RecordingSid")
@@ -834,6 +908,12 @@ def register_websocket(app):
                 if event_type in {"connected", "setup", "start"}:
                     session_id = data.get("sessionId")
                     if session_id:
+                        if len(active_conversations) >= Config.MAX_CONCURRENT_SESSIONS:
+                            print(
+                                f"[ConversationRelay] Session cap ({Config.MAX_CONCURRENT_SESSIONS}) reached; "
+                                f"rejecting session_id={session_id}"
+                            )
+                            break
                         call_sid = data.get("callSid") or ws_call_sid
                         tenant_id = ws_tenant_id or _resolve_tenant_id_for_call_sid(call_sid)
                         tenant_config = _get_tenant_agent_config(tenant_id) if tenant_id else {}
@@ -981,6 +1061,10 @@ def register_websocket(app):
         finally:
             if session_id and session_id in active_conversations:
                 del active_conversations[session_id]
+            # Clean up the recording guard for this call so the set doesn't grow.
+            if ws_call_sid:
+                with recording_lock:
+                    recording_started_calls.discard(ws_call_sid)
 
 
 def get_openai_response(

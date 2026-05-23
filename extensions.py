@@ -56,10 +56,21 @@ def init_supabase(app):
                 pool=Config.SUPABASE_HTTP_POOL_TIMEOUT,
             ),
         )
-        options = ClientOptions(httpx_client=httpx_client)
+        # Pass the service role key as the Authorization header at init time so
+        # PostgREST bypasses RLS for every table query this client makes.
+        # Setting it here (ClientOptions.headers) is more reliable than calling
+        # .auth() after construction because some SDK versions ignore the latter.
+        options = ClientOptions(
+            headers={"Authorization": f"Bearer {Config.SUPABASE_SECRET_KEY}"},
+            httpx_client=httpx_client,
+        )
         client = create_client(Config.SUPABASE_URL, Config.SUPABASE_SECRET_KEY, options=options)
     except Exception:
         client = create_client(Config.SUPABASE_URL, Config.SUPABASE_SECRET_KEY)
+
+    # Belt-and-suspenders: also set it on the already-constructed PostgREST
+    # session so the header is present regardless of which code path ran above.
+    client.postgrest.auth(Config.SUPABASE_SECRET_KEY)
 
     app.supabase_client = client
     print("✅ Supabase client initialized")
@@ -92,6 +103,7 @@ def register_blueprints(app):
     from blueprints.twilio_phone_numbers import twilio_bp
     from blueprints.integrations_google_calendar import google_calendar_integration_bp
     from blueprints.integrations_hubspot import hubspot_integration_bp
+    from blueprints.super_admin import super_admin_bp
 
     app.register_blueprint(auth_bp, url_prefix="/auth")
     app.register_blueprint(tenant_bp, url_prefix="/tenant")
@@ -99,6 +111,7 @@ def register_blueprints(app):
     app.register_blueprint(twilio_bp, url_prefix="/twilio")
     app.register_blueprint(google_calendar_integration_bp, url_prefix="/integrations/google-calendar")
     app.register_blueprint(hubspot_integration_bp, url_prefix="/integrations/hubspot")
+    app.register_blueprint(super_admin_bp, url_prefix="/admin")
 
     register_websocket(app)
     print("✅ Blueprints registered")

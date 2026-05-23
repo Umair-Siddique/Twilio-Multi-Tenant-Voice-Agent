@@ -443,6 +443,23 @@ RETURNS BOOLEAN AS $$
     );
 $$ LANGUAGE SQL SECURITY DEFINER;
 
+-- Aggregate calls by tenant for the super-admin analytics dashboard.
+-- Called via supabase.rpc("get_top_tenants_by_calls", {"limit_n": 10}).
+CREATE OR REPLACE FUNCTION get_top_tenants_by_calls(limit_n INT DEFAULT 10)
+RETURNS TABLE(tenant_id UUID, tenant_name TEXT, call_count BIGINT)
+LANGUAGE SQL SECURITY DEFINER AS $$
+    SELECT c.tenant_id, t.name AS tenant_name, COUNT(*) AS call_count
+    FROM calls c
+    JOIN tenants t ON t.id = c.tenant_id
+    GROUP BY c.tenant_id, t.name
+    ORDER BY call_count DESC
+    LIMIT limit_n;
+$$;
+
+-- Add voice selection column to tenant agent config (run once).
+-- ALTER TABLE tenant_agent_config
+--     ADD COLUMN IF NOT EXISTS voice_id VARCHAR(100) DEFAULT 'google-en-US-Neural2-F';
+
 -- Function to update updated_at timestamp
 CREATE OR REPLACE FUNCTION update_updated_at_column()
 RETURNS TRIGGER AS $$
