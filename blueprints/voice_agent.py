@@ -991,36 +991,19 @@ def register_websocket(app):
                     hangup_state = {"requested": False}
                     is_goodbye = _voice_is_likely_goodbye(transcript)
 
-                    # If we expect tool usage / longer reasoning, speak immediately to reduce perceived latency.
-                    if wants_tools:
-                        try:
-                            ws.send(
-                                json.dumps(
-                                    {
-                                        "type": "text",
-                                        "token": (Config.VOICE_WAIT_MESSAGE or "One moment while I check that.").strip(),
-                                        "last": True,
-                                        # Caller cannot interrupt this line; following assistant text can preempt it.
-                                        "interruptible": False,
-                                        "preemptible": True,
-                                    }
-                                )
-                            )
-                        except Exception:
-                            pass
-
+                    # Stream tokens directly into ConversationRelay for minimum first-token latency.
+                    # The "one moment" filler is sent from inside get_openai_response only when a
+                    # real integration tool call actually fires — never for unconfigured tenants.
                     ai_response = get_openai_response(
                         messages,
+                        ws=ws,
                         credentials_json=cred_json if wants_tools else None,
                         hubspot_access_token=hubspot_token if wants_tools else None,
                         hangup_state=hangup_state,
                         include_end_call=wants_tools or is_goodbye,
                     )
                     messages.append({"role": "assistant", "content": ai_response})
-
-                    # ConversationRelay output format (text token).
-                    ws.send(json.dumps({"type": "text", "token": ai_response, "last": True}))
-                    print(f"[ConversationRelay] Sent assistant text token: {ai_response}")
+                    print(f"[ConversationRelay] Sent assistant text: {ai_response}")
 
                     if wants_tools:
                         drain_outcome = _drain_tool_cycle_user_prompts(ws)
@@ -1067,8 +1050,89 @@ def register_websocket(app):
                     recording_started_calls.discard(ws_call_sid)
 
 
+def _ws_send_safe(ws, payload):
+    if ws is None:
+        return False
+    try:
+        ws.send(json.dumps(payload))
+        return True
+    except Exception:
+        return False
+
+
+# Markdown / formatting characters that get read aloud literally by TTS providers.
+# Stripping per-character is safe even mid-stream (no multi-char state required).
+_TTS_STRIP_CHARS = str.maketrans("", "", "*_`#~|<>{}[]\\")
+_TTS_MD_LINK_RE = re.compile(r"\[([^\]]+)\]\([^)]+\)")
+_TTS_MULTISPACE_RE = re.compile(r"  +")
+
+
+def _sanitize_for_tts_stream(text):
+    """Strip markdown chars from a streamed delta. Safe per-chunk."""
+    if not text:
+        return text
+    return text.translate(_TTS_STRIP_CHARS)
+
+
+def _sanitize_for_tts_full(text):
+    """Full-text sanitization for non-streamed sends — also rewrites multi-char markdown."""
+    if not text:
+        return text
+    text = _TTS_MD_LINK_RE.sub(r"\1", text)  # [label](url) -> label
+    text = text.translate(_TTS_STRIP_CHARS)
+    text = _TTS_MULTISPACE_RE.sub(" ", text)
+    return text.strip()
+
+
+def _send_full_text(ws, text):
+    clean = _sanitize_for_tts_full(text)
+    if not clean:
+        return
+    _ws_send_safe(ws, {"type": "text", "token": clean, "last": True})
+
+
+def _stream_chat_to_ws(client, ws, *, model, msgs, temperature, max_tokens, timeout):
+    """Stream a non-tool chat completion; emit each delta to ConversationRelay immediately."""
+    chunks = []
+    ws_ok = ws is not None
+    try:
+        stream = client.chat.completions.create(
+            model=model,
+            messages=msgs,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            timeout=timeout,
+            stream=True,
+        )
+        for chunk in stream:
+            try:
+                delta = chunk.choices[0].delta.content
+            except (IndexError, AttributeError):
+                continue
+            if not delta:
+                continue
+            clean = _sanitize_for_tts_stream(delta)
+            if not clean:
+                continue
+            chunks.append(clean)
+            if ws_ok and not _ws_send_safe(ws, {"type": "text", "token": clean, "last": False}):
+                ws_ok = False
+    except Exception as exc:
+        print(f"[Stream] OpenAI streaming failed: {exc}")
+        traceback.print_exc()
+
+    full = "".join(chunks).strip() or "Could you repeat that, please?"
+    if ws_ok:
+        _ws_send_safe(ws, {"type": "text", "token": "", "last": True})
+    elif ws is not None and not chunks:
+        # Streaming produced nothing and ws is still open: deliver fallback.
+        _send_full_text(ws, full)
+    return full
+
+
 def get_openai_response(
     messages,
+    ws=None,
     credentials_json=None,
     hubspot_access_token=None,
     hangup_state=None,
@@ -1077,7 +1141,9 @@ def get_openai_response(
     try:
         openai_client = current_app.openai_client
         if not openai_client:
-            return "I am sorry, the AI service is currently unavailable."
+            fallback = "I am sorry, the AI service is currently unavailable."
+            _send_full_text(ws, fallback)
+            return fallback
 
         cal_defs, cal_by_name = ([], {})
         if credentials_json:
@@ -1097,8 +1163,23 @@ def get_openai_response(
         has_integration_tools = bool(cal_defs or hub_defs)
         use_tools_api = bool(tools_defs)
         msgs = [dict(m) for m in messages]
-        max_rounds = int(getattr(Config, "VOICE_TOOL_MAX_ROUNDS", None) or 3) if use_tools_api else 1
-        for _ in range(max_rounds):
+
+        # Fast path: no tools needed at all → stream straight to ConversationRelay.
+        if not use_tools_api:
+            model_name = Config.OPENAI_VOICE_FAST_MODEL or Config.OPENAI_MODEL
+            return _stream_chat_to_ws(
+                openai_client,
+                ws,
+                model=model_name,
+                msgs=msgs,
+                temperature=0.4,
+                max_tokens=int(getattr(Config, "VOICE_FAST_MAX_TOKENS", None) or 350),
+                timeout=float(getattr(Config, "VOICE_FAST_TIMEOUT_SECONDS", None) or 8),
+            )
+
+        max_rounds = int(getattr(Config, "VOICE_TOOL_MAX_ROUNDS", None) or 3)
+        wait_sent = False
+        for round_idx in range(max_rounds):
             if has_integration_tools:
                 model_name = Config.OPENAI_MODEL
                 temperature = 0.5
@@ -1112,22 +1193,36 @@ def get_openai_response(
                 max_tokens = int(getattr(Config, "VOICE_FAST_MAX_TOKENS", None) or 350)
                 timeout_s = float(getattr(Config, "VOICE_FAST_TIMEOUT_SECONDS", None) or 8)
 
-            create_kwargs = {
-                "model": model_name,
-                "messages": msgs,
-                "temperature": temperature,
-                "max_tokens": max_tokens,
-                "timeout": timeout_s,
-            }
-            if use_tools_api:
-                create_kwargs["tools"] = tools_defs
-                create_kwargs["tool_choice"] = "auto"
-
-            response = openai_client.chat.completions.create(**create_kwargs)
+            response = openai_client.chat.completions.create(
+                model=model_name,
+                messages=msgs,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                timeout=timeout_s,
+                tools=tools_defs,
+                tool_choice="auto",
+            )
             msg = response.choices[0].message
 
-            if not use_tools_api or not msg.tool_calls:
-                return (msg.content or "").strip() or "Could you repeat that, please?"
+            if not msg.tool_calls:
+                text = (msg.content or "").strip() or "Could you repeat that, please?"
+                _send_full_text(ws, text)
+                return text
+
+            # An integration tool will actually run → now (and only now) play the filler line.
+            integration_calls = [tc for tc in msg.tool_calls if tc.function.name != "end_call"]
+            if integration_calls and not wait_sent:
+                _ws_send_safe(
+                    ws,
+                    {
+                        "type": "text",
+                        "token": (Config.VOICE_WAIT_MESSAGE or "One moment while I check that.").strip(),
+                        "last": True,
+                        "interruptible": False,
+                        "preemptible": True,
+                    },
+                )
+                wait_sent = True
 
             assistant_payload = {
                 "role": "assistant",
@@ -1153,7 +1248,6 @@ def get_openai_response(
                 except json.JSONDecodeError:
                     args = {}
 
-                tool_fn = None
                 if name in cal_by_name:
                     tool_fn = cal_by_name[name]
                     if not credentials_json:
@@ -1197,11 +1291,15 @@ def get_openai_response(
 
                 msgs.append({"role": "tool", "tool_call_id": tc.id, "content": content})
 
-        return "I could not finish that request in time. Please try again."
+        timeout_msg = "I could not finish that request in time. Please try again."
+        _send_full_text(ws, timeout_msg)
+        return timeout_msg
     except Exception as exc:
         print(f"OpenAI response error: {exc}")
         traceback.print_exc()
-        return "I am having trouble right now. Please try again."
+        err = "I am having trouble right now. Please try again."
+        _send_full_text(ws, err)
+        return err
 
 
 def _voice_transcript_may_need_tools(transcript: str) -> bool:

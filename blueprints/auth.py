@@ -23,29 +23,6 @@ def handle_errors(f):
     return decorated_function
 
 
-def _extract_action_link(generate_link_response):
-    """Extract recovery action link from different Supabase client response shapes."""
-    if generate_link_response is None:
-        return None
-
-    if isinstance(generate_link_response, dict):
-        if generate_link_response.get("action_link"):
-            return generate_link_response.get("action_link")
-        if isinstance(generate_link_response.get("properties"), dict):
-            return generate_link_response["properties"].get("action_link")
-
-    if hasattr(generate_link_response, "action_link"):
-        return getattr(generate_link_response, "action_link")
-
-    properties = getattr(generate_link_response, "properties", None)
-    if isinstance(properties, dict):
-        return properties.get("action_link")
-    if properties is not None and hasattr(properties, "action_link"):
-        return getattr(properties, "action_link")
-
-    return None
-
-
 def _send_reset_email_via_smtp(email_to, reset_link):
     """Send password reset email using SMTP instead of Supabase email service."""
     smtp_user = Config.ADMIN_EMAIL
