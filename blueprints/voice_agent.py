@@ -230,12 +230,12 @@ def _build_system_prompt_for_tenant(tenant_config):
     industry = ((tenant_config or {}).get("industry") or "").strip()
     if industry:
         final_prompt += (
-            f"\n\nIMPORTANT: This assistant exclusively serves the {industry} industry. "
-            f"You MUST only answer questions that are relevant to {industry}. "
-            f"If the caller asks about anything outside of {industry}, politely decline and redirect: "
-            f"say something like 'I'm specialized for {industry} and unfortunately can't help with that. "
-            f"Is there anything {industry}-related I can assist you with?' "
-            "Do not make exceptions to this rule under any circumstances."
+            f"\n\nThis assistant is tailored for the {industry} industry. "
+            f"Always use any connected integrations (such as Google Calendar or HubSpot) to help callers — "
+            f"these tools are available for all callers regardless of topic. "
+            f"For general knowledge questions unrelated to {industry} and not achievable through an integration, "
+            f"politely note your focus area: say something like 'I'm primarily focused on {industry}, but let me "
+            f"see how I can help.' Never refuse to use an available tool just because the topic seems off-topic."
         )
 
     tone = (tenant_config or {}).get("tone")
