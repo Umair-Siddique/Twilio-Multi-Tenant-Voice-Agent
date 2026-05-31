@@ -8,6 +8,7 @@ require a manual browser refresh; a short retry typically succeeds.
 
 from __future__ import annotations
 
+import errno
 import random
 import time
 from typing import Any, Callable, Optional
@@ -18,11 +19,15 @@ def _is_transient_disconnect(exc: BaseException) -> bool:
     if "server disconnected" in msg:
         return True
 
+    # OSError/BlockingIOError errno 11 (EAGAIN) — socket not ready yet.
+    if isinstance(exc, OSError) and exc.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
+        return True
+
     # Prefer type checks when available.
     try:
         import httpx  # type: ignore
 
-        if isinstance(exc, httpx.RemoteProtocolError):
+        if isinstance(exc, (httpx.RemoteProtocolError, httpx.ConnectError, httpx.PoolTimeout)):
             return True
     except Exception:
         pass

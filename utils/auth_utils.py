@@ -20,14 +20,16 @@ def verify_token(token):
         supabase = get_supabase_client()
         if not supabase:
             return None, "Supabase not configured"
-        
-        user_response = supabase.auth.get_user(token)
-        
+
+        user_response = supabase_call_with_retry(
+            lambda: supabase.auth.get_user(token)
+        )
+
         if not user_response.user:
             return None, "Invalid token"
-        
+
         return user_response.user.id, None
-        
+
     except Exception as e:
         return None, str(e)
 
