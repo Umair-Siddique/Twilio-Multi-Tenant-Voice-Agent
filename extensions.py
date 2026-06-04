@@ -44,7 +44,7 @@ def init_supabase(app):
             limits=httpx.Limits(
                 max_connections=Config.SUPABASE_HTTP_MAX_CONNECTIONS,
                 max_keepalive_connections=Config.SUPABASE_HTTP_MAX_KEEPALIVE,
-                keepalive_expiry=None,
+                keepalive_expiry=60,  # Render LB kills idle sockets at ~75s; expire before that
             ),
         )
         httpx_client = httpx.Client(
