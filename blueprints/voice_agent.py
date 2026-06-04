@@ -17,7 +17,9 @@ from twilio.request_validator import RequestValidator
 from twilio.twiml.voice_response import Connect, ConversationRelay, Language, VoiceResponse
 
 from config import Config
+from utils.supabase_retry import supabase_call_with_retry
 from utils.system_prompt import system_prompt, greeting_prompt
+from utils.recording_email import send_recording_email
 from utils.tenant_google_calendar_credentials import (
     load_credentials_json_for_tenant,
     tenant_may_use_calendar_tools,
@@ -667,12 +669,15 @@ def handle_call_status():
                         pass
 
             # Ensure call row exists before update for cases where /incoming-call insert failed.
-            if not (
-                supabase.table("calls").select("id").eq("call_sid", call_sid).limit(1).execute().data
-            ):
+            check = supabase_call_with_retry(
+                lambda: supabase.table("calls").select("id").eq("call_sid", call_sid).limit(1).execute()
+            )
+            if not check.data:
                 _create_call_record(call_sid, from_number, to_number)
 
-            supabase.table("calls").update(update_data).eq("call_sid", call_sid).execute()
+            supabase_call_with_retry(
+                lambda: supabase.table("calls").update(update_data).eq("call_sid", call_sid).execute()
+            )
     except Exception as e:
         print(f"[CallStatus] Failed updating call row for {call_sid}: {e}")
 
@@ -743,11 +748,25 @@ def _save_recording_for_call(call_sid, recording_sid, recording_url, recording_d
 
     call_id = None
     tenant_id = None
+    call_data = {"call_sid": call_sid}
     try:
-        call_row = supabase.table("calls").select("id, tenant_id").eq("call_sid", call_sid).execute()
+        call_row = supabase_call_with_retry(
+            lambda: supabase.table("calls")
+            .select("id, tenant_id, from_number, to_number, duration_seconds, start_time")
+            .eq("call_sid", call_sid)
+            .execute()
+        )
         if call_row.data and len(call_row.data) > 0:
-            call_id = call_row.data[0].get("id")
-            tenant_id = call_row.data[0].get("tenant_id")
+            row = call_row.data[0]
+            call_id = row.get("id")
+            tenant_id = row.get("tenant_id")
+            call_data.update({
+                "call_id": row.get("id"),
+                "from_number": row.get("from_number"),
+                "to_number": row.get("to_number"),
+                "duration_seconds": row.get("duration_seconds") or recording_duration,
+                "start_time": row.get("start_time"),
+            })
     except Exception as e:
         print(f"[Recording] Could not load call row for {call_sid}: {e}")
 
@@ -791,14 +810,91 @@ def _save_recording_for_call(call_sid, recording_sid, recording_url, recording_d
             if tenant_id:
                 payload["tenant_id"] = tenant_id
             try:
-                supabase.table("recordings").insert(payload).execute()
+                supabase_call_with_retry(
+                    lambda: supabase.table("recordings").insert(payload).execute()
+                )
             except Exception as e:
                 print(f"[Recording] File uploaded but recordings row insert failed: {e}")
         else:
             print(f"[Recording] File uploaded without DB row (no call row found for {call_sid})")
         print(f"[Recording] Saved to Supabase: {storage_path}")
+
+        # Send email notification with the recording attached.
+        if tenant_id:
+            _send_recording_email_async(
+                app=current_app._get_current_object(),
+                tenant_id=tenant_id,
+                call_data=call_data,
+                audio_bytes=audio_bytes,
+                recording_sid=recording_sid,
+            )
+
         return True
     return False
+
+
+def _send_recording_email_async(app, tenant_id, call_data, audio_bytes, recording_sid):
+    """Fetch tenant recipients, send the recording email, and log the result to email_logs."""
+    def run():
+        with app.app_context():
+            supabase = getattr(app, "supabase_client", None)
+            if not supabase:
+                return
+            recipients = []
+            subject = None
+            success = False
+            error_message = None
+            try:
+                tenant_row = supabase_call_with_retry(
+                    lambda: supabase.table("tenants")
+                    .select("name, default_email_recipients")
+                    .eq("id", tenant_id)
+                    .limit(1)
+                    .execute()
+                )
+                if not tenant_row.data:
+                    print(f"[RecordingEmail] Tenant {tenant_id} not found — skipping email")
+                    return
+                tenant = tenant_row.data[0]
+                recipients = tenant.get("default_email_recipients") or []
+                if not recipients:
+                    print(f"[RecordingEmail] No recipients configured for tenant {tenant_id}")
+                    return
+                call_data["tenant_name"] = tenant.get("name") or ""
+                from_number = call_data.get("from_number") or "Unknown"
+                subject = f"AiDan Pro — Call Recording ({from_number})"
+                success, error_message = send_recording_email(
+                    recipients=recipients,
+                    call_data=call_data,
+                    audio_bytes=audio_bytes,
+                    recording_sid=recording_sid,
+                )
+            except Exception as e:
+                error_message = str(e)
+                print(f"[RecordingEmail] Background email task failed: {e}")
+            finally:
+                # Always write a log row so the admin email-logs API has a record.
+                if recipients:
+                    try:
+                        log_row = {
+                            "tenant_id": tenant_id,
+                            "email_type": "call_recording",
+                            "recipients": recipients,
+                            "subject": subject or f"AiDan Pro — Call Recording",
+                            "status": "sent" if success else "failed",
+                            "sent_at": datetime.now(timezone.utc).isoformat(),
+                        }
+                        if call_data.get("call_id"):
+                            log_row["call_id"] = call_data["call_id"]
+                        if error_message:
+                            log_row["error_message"] = error_message
+                        supabase_call_with_retry(
+                            lambda: supabase.table("email_logs").insert(log_row).execute()
+                        )
+                    except Exception as log_exc:
+                        print(f"[RecordingEmail] Failed to write email_log row: {log_exc}")
+
+    threading.Thread(target=run, daemon=True).start()
 
 
 def _fetch_and_store_recording_async(call_sid, max_attempts=6, delay_seconds=5):

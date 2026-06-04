@@ -37,7 +37,7 @@ Required Supabase table:
 
 from flask import Blueprint, request, jsonify, current_app
 from functools import wraps
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 import traceback
 
 from utils.auth_utils import verify_token
@@ -815,9 +815,45 @@ def all_calls(admin_user_id):
     except Exception as e:
         return jsonify({"error": f"calls table unavailable: {e}"}), 503
 
-    total = resp.count or len(resp.data)
+    calls = resp.data or []
+
+    # For calls still showing ringing/in-progress that are older than 60 s,
+    # the status callback either failed or hasn't arrived yet — pull the real
+    # status and duration directly from Twilio and patch both the response and
+    # the DB so the next request doesn't repeat this work.
+    twilio = current_app.twilio_client
+    if twilio:
+        cutoff = datetime.now(timezone.utc) - timedelta(seconds=60)
+        stale = [
+            c for c in calls
+            if c.get("status") in ("ringing", "in-progress")
+            and c.get("call_sid")
+            and c.get("created_at")
+            and datetime.fromisoformat(c["created_at"].replace("Z", "+00:00")) < cutoff
+        ]
+        for call in stale:
+            try:
+                tw = twilio.calls(call["call_sid"]).fetch()
+                patch = {"status": tw.status}
+                if tw.status == "completed":
+                    if tw.duration:
+                        patch["duration_seconds"] = int(tw.duration)
+                    if tw.end_time:
+                        patch["end_time"] = tw.end_time.isoformat()
+                elif tw.status in ("busy", "failed", "no-answer", "canceled"):
+                    if tw.end_time:
+                        patch["end_time"] = tw.end_time.isoformat()
+                supabase_call_with_retry(
+                    lambda sid=call["call_sid"], p=patch:
+                        supabase.table("calls").update(p).eq("call_sid", sid).execute()
+                )
+                call.update(patch)
+            except Exception:
+                pass
+
+    total = resp.count or len(calls)
     return jsonify({
-        "calls": resp.data or [],
+        "calls": calls,
         "pagination": {
             "page": page,
             "per_page": per_page,
