@@ -33,11 +33,19 @@ def create_app():
         succeeds, silently replacing the service role key with the user JWT.
         That leaves RLS active for all subsequent table queries, scoping every
         cross-tenant admin query to just the signed-in user's own tenant.
-        Reset to the service role key before every request so the PostgREST
-        client always bypasses RLS regardless of prior sign-in events.
+        Reset to the service role key before every request so both the
+        PostgREST client and the Auth Admin client always use the service role
+        key, regardless of prior sign-in events.
         """
         client = getattr(app, "supabase_client", None)
         if client and Config.SUPABASE_SECRET_KEY:
             client.postgrest.auth(Config.SUPABASE_SECRET_KEY)
+            # Also reset the GoTrue auth client headers so that
+            # supabase.auth.admin.* calls use the service role key instead of
+            # a user JWT that may have been set by a prior sign_in call.
+            try:
+                client.auth._headers["Authorization"] = f"Bearer {Config.SUPABASE_SECRET_KEY}"
+            except Exception:
+                pass
 
     return app
