@@ -18,7 +18,7 @@ from twilio.twiml.voice_response import Connect, ConversationRelay, Language, Vo
 
 from config import Config
 from utils.supabase_retry import supabase_call_with_retry
-from utils.system_prompt import system_prompt, greeting_prompt
+from utils.system_prompt import system_prompt, greeting_prompt, voice_agent_base_prompt
 from utils.recording_email import send_recording_email
 from utils.tenant_google_calendar_credentials import (
     load_credentials_json_for_tenant,
@@ -217,9 +217,9 @@ def _get_tenant_agent_config(tenant_id):
 
 
 def _build_system_prompt_for_tenant(tenant_config):
-    """Build final system prompt from tenant override or global default, plus tone/custom_prompts."""
+    """Build final system prompt: fixed simple-agent rules + tenant override or global default, plus tone/custom_prompts."""
     tenant_override = ((tenant_config or {}).get("system_prompt") or "").strip()
-    base_prompt = tenant_override if tenant_override else (system_prompt or "").strip()
+    dynamic_prompt = tenant_override if tenant_override else (system_prompt or "").strip()
 
     # Prepend a language enforcement rule so the model always replies in the system prompt's language.
     language_rule = (
@@ -227,7 +227,12 @@ def _build_system_prompt_for_tenant(tenant_config):
         "and the welcome greeting — no exceptions. Even if the caller speaks a completely different language, "
         "you MUST reply only in your configured language. Never switch languages under any circumstances."
     )
-    final_prompt = language_rule + "\n\n" + base_prompt
+
+    # Fixed rules apply to every tenant first; the tenant's own prompt is layered
+    # on top for business identity/context but cannot override the fixed rules.
+    final_prompt = language_rule + "\n\n" + (voice_agent_base_prompt or "").strip()
+    if dynamic_prompt:
+        final_prompt += "\n\n" + dynamic_prompt
 
     industry = ((tenant_config or {}).get("industry") or "").strip()
     if industry:
@@ -991,17 +996,27 @@ def register_websocket(app):
         session_id = None
         ws_tenant_id = request.args.get("tenant_id")
         ws_call_sid = request.args.get("call_sid")
+        pending_message = None
         try:
             while True:
-                raw_message = ws.receive(timeout=1)
-                if not raw_message:
-                    continue
+                if pending_message is not None:
+                    raw_message = pending_message
+                    pending_message = None
+                else:
+                    raw_message = ws.receive(timeout=1)
+                    if not raw_message:
+                        continue
 
                 data = json.loads(raw_message)
                 event_type = data.get("event") or data.get("type")
                 print(f"[ConversationRelay] Incoming message: {data}")
 
-                if event_type in {"connected", "setup", "start"}:
+                if event_type == "interrupt":
+                    # Caller barged in while we weren't mid-stream (e.g. during the
+                    # welcome greeting) — nothing for us to stop.
+                    continue
+
+                elif event_type in {"connected", "setup", "start"}:
                     session_id = data.get("sessionId")
                     if session_id:
                         if len(active_conversations) >= Config.MAX_CONCURRENT_SESSIONS:
@@ -1085,6 +1100,7 @@ def register_websocket(app):
                                 active_conversations[session_id]["integration_last_refresh_ts"] = now
 
                     hangup_state = {"requested": False}
+                    interrupt_state = {}
                     is_goodbye = _voice_is_likely_goodbye(transcript)
 
                     # Stream tokens directly into ConversationRelay for minimum first-token latency.
@@ -1097,9 +1113,41 @@ def register_websocket(app):
                         hubspot_access_token=hubspot_token if wants_tools else None,
                         hangup_state=hangup_state,
                         include_end_call=wants_tools or is_goodbye,
+                        interrupt_state=interrupt_state,
                     )
+
+                    interrupt_kind = interrupt_state.get("kind")
+
+                    # Caller barged in mid-response: stop immediately, record only what
+                    # they actually heard, and go straight back to listening for the
+                    # query that interrupted us.
+                    if interrupt_kind == "interrupt":
+                        heard = interrupt_state.get("utterance") or ""
+                        if heard:
+                            messages.append({"role": "assistant", "content": heard})
+                        print(f"[ConversationRelay] Caller interrupted; stopped response early. Heard: {heard!r}")
+                        continue
+
+                    # Session ended while we were still streaming a response.
+                    if interrupt_kind == "stop":
+                        if session_id and session_id in active_conversations:
+                            call_sid_stop = active_conversations[session_id].get("call_sid")
+                            if call_sid_stop:
+                                print(
+                                    f"[Recording] WebSocket stop mid-response. "
+                                    f"Triggering recording poll for call {call_sid_stop}"
+                                )
+                                _fetch_and_store_recording_async(call_sid_stop)
+                        break
+
                     messages.append({"role": "assistant", "content": ai_response})
                     print(f"[ConversationRelay] Sent assistant text: {ai_response}")
+
+                    # A new finalized transcript already arrived while we were still
+                    # responding — handle it right away instead of waiting on receive().
+                    if interrupt_kind == "prompt":
+                        pending_message = json.dumps(interrupt_state["data"])
+                        continue
 
                     if wants_tools:
                         drain_outcome = _drain_tool_cycle_user_prompts(ws)
@@ -1156,6 +1204,39 @@ def _ws_send_safe(ws, payload):
         return False
 
 
+def _poll_ws_interrupt(ws):
+    """
+    Non-blocking check for a ConversationRelay barge-in signal while we're
+    streaming a response. ConversationRelay sends an "interrupt" event the
+    moment the caller starts talking over the agent, carrying whatever text
+    was actually spoken so far in "utteranceUntilInterrupt". Returns None if
+    nothing is pending, otherwise one of:
+      {"kind": "interrupt", "utterance": "..."}  - caller barged in
+      {"kind": "prompt", "data": <message dict>} - a new transcript already arrived
+      {"kind": "stop"}                           - the call/session ended
+    """
+    if ws is None:
+        return None
+    try:
+        raw = ws.receive(timeout=0)
+    except Exception:
+        return None
+    if not raw:
+        return None
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    event_type = data.get("event") or data.get("type")
+    if event_type == "interrupt":
+        return {"kind": "interrupt", "utterance": (data.get("utteranceUntilInterrupt") or "").strip()}
+    if event_type in {"stop", "error"}:
+        return {"kind": "stop"}
+    if event_type in {"media", "prompt", "input"}:
+        return {"kind": "prompt", "data": data}
+    return None
+
+
 # Markdown / formatting characters that get read aloud literally by TTS providers.
 # Stripping per-character is safe even mid-stream (no multi-char state required).
 _TTS_STRIP_CHARS = str.maketrans("", "", "*_`#~|<>{}[]\\")
@@ -1187,43 +1268,159 @@ def _send_full_text(ws, text):
     _ws_send_safe(ws, {"type": "text", "token": clean, "last": True})
 
 
-def _stream_chat_to_ws(client, ws, *, model, msgs, temperature, max_tokens, timeout):
+def _stream_chat_to_ws(client, ws, *, model, msgs, temperature, max_tokens, timeout, interrupt_state=None):
     """Stream a non-tool chat completion; emit each delta to ConversationRelay immediately."""
     chunks = []
     ws_ok = ws is not None
     try:
-        stream = client.chat.completions.create(
+        with client.chat.completions.create(
             model=model,
             messages=msgs,
             temperature=temperature,
             max_tokens=max_tokens,
             timeout=timeout,
             stream=True,
-        )
-        for chunk in stream:
-            try:
-                delta = chunk.choices[0].delta.content
-            except (IndexError, AttributeError):
-                continue
-            if not delta:
-                continue
-            clean = _sanitize_for_tts_stream(delta)
-            if not clean:
-                continue
-            chunks.append(clean)
-            if ws_ok and not _ws_send_safe(ws, {"type": "text", "token": clean, "last": False}):
-                ws_ok = False
+        ) as stream:
+            for chunk in stream:
+                try:
+                    delta = chunk.choices[0].delta.content
+                except (IndexError, AttributeError):
+                    delta = None
+                if delta:
+                    clean = _sanitize_for_tts_stream(delta)
+                    if clean:
+                        chunks.append(clean)
+                        if ws_ok and not _ws_send_safe(ws, {"type": "text", "token": clean, "last": False}):
+                            ws_ok = False
+
+                if interrupt_state is not None and ws_ok:
+                    pending = _poll_ws_interrupt(ws)
+                    if pending:
+                        interrupt_state.update(pending)
+                        break
     except Exception as exc:
         print(f"[Stream] OpenAI streaming failed: {exc}")
         traceback.print_exc()
 
     full = "".join(chunks).strip() or "Could you repeat that, please?"
+    if interrupt_state and interrupt_state.get("kind"):
+        # Caller barged in or the session ended — don't close out a turn Twilio
+        # already abandoned.
+        return full
     if ws_ok:
         _ws_send_safe(ws, {"type": "text", "token": "", "last": True})
     elif ws is not None and not chunks:
         # Streaming produced nothing and ws is still open: deliver fallback.
         _send_full_text(ws, full)
     return full
+
+
+def _stream_chat_with_tools_to_ws(
+    client, ws, *, model, msgs, temperature, max_tokens, timeout, tools_defs, wait_state, interrupt_state=None
+):
+    """
+    Stream a tool-enabled chat completion. Text deltas go straight to
+    ConversationRelay just like the no-tools fast path, so a plain-text reply
+    never sits in silence waiting for the full completion to finish. If the
+    model starts an integration tool call, the "one moment" filler is sent the
+    instant the tool name is known instead of after the whole response lands.
+
+    Returns (content_text, tool_calls) where tool_calls is a list of
+    {"id", "name", "arguments"} dicts (empty when the model replied with text only).
+    """
+    chunks = []
+    tool_calls_acc = {}
+    content_streamed = False
+    ws_ok = ws is not None
+
+    try:
+        with client.chat.completions.create(
+            model=model,
+            messages=msgs,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            timeout=timeout,
+            tools=tools_defs,
+            tool_choice="auto",
+            stream=True,
+        ) as stream:
+            for chunk in stream:
+                try:
+                    delta = chunk.choices[0].delta
+                except (IndexError, AttributeError):
+                    delta = None
+                if delta is None:
+                    continue
+
+                if delta.content:
+                    clean = _sanitize_for_tts_stream(delta.content)
+                    if clean:
+                        chunks.append(clean)
+                        content_streamed = True
+                        if ws_ok and not _ws_send_safe(ws, {"type": "text", "token": clean, "last": False}):
+                            ws_ok = False
+
+                for tc_delta in (delta.tool_calls or []):
+                    entry = tool_calls_acc.setdefault(tc_delta.index, {"id": None, "name": None, "arguments": ""})
+                    if tc_delta.id:
+                        entry["id"] = tc_delta.id
+                    fn = tc_delta.function
+                    if fn:
+                        if fn.name:
+                            entry["name"] = fn.name
+                            # An integration tool will actually run -> play the filler
+                            # immediately, the moment we know its name (don't wait for
+                            # the full response, and don't talk over a text reply).
+                            if (
+                                fn.name != "end_call"
+                                and not content_streamed
+                                and not wait_state.get("sent")
+                                and ws_ok
+                            ):
+                                _ws_send_safe(
+                                    ws,
+                                    {
+                                        "type": "text",
+                                        "token": (Config.VOICE_WAIT_MESSAGE or "One moment while I check that.").strip(),
+                                        "last": True,
+                                        "interruptible": False,
+                                        "preemptible": True,
+                                    },
+                                )
+                                wait_state["sent"] = True
+                        if fn.arguments:
+                            entry["arguments"] += fn.arguments
+
+                if interrupt_state is not None and ws_ok:
+                    pending = _poll_ws_interrupt(ws)
+                    if pending:
+                        interrupt_state.update(pending)
+                        break
+    except Exception as exc:
+        print(f"[Stream] OpenAI tool streaming failed: {exc}")
+        traceback.print_exc()
+
+    tool_calls = [
+        {"id": entry["id"] or f"call_{idx}", "name": entry["name"], "arguments": entry["arguments"] or "{}"}
+        for idx, entry in sorted(tool_calls_acc.items())
+        if entry["name"]
+    ]
+
+    full = "".join(chunks).strip()
+    if interrupt_state and interrupt_state.get("kind"):
+        # Caller barged in or the session ended — don't execute tools or close
+        # out a turn Twilio already abandoned.
+        return full, []
+
+    if not tool_calls:
+        text = full or "Could you repeat that, please?"
+        if ws_ok:
+            _ws_send_safe(ws, {"type": "text", "token": "", "last": True})
+        elif ws is not None and not chunks:
+            _send_full_text(ws, text)
+        return text, []
+
+    return full, tool_calls
 
 
 def get_openai_response(
@@ -1233,6 +1430,7 @@ def get_openai_response(
     hubspot_access_token=None,
     hangup_state=None,
     include_end_call=True,
+    interrupt_state=None,
 ):
     try:
         openai_client = current_app.openai_client
@@ -1271,10 +1469,11 @@ def get_openai_response(
                 temperature=0.4,
                 max_tokens=int(getattr(Config, "VOICE_FAST_MAX_TOKENS", None) or 350),
                 timeout=float(getattr(Config, "VOICE_FAST_TIMEOUT_SECONDS", None) or 8),
+                interrupt_state=interrupt_state,
             )
 
         max_rounds = int(getattr(Config, "VOICE_TOOL_MAX_ROUNDS", None) or 3)
-        wait_sent = False
+        wait_state = {"sent": False}
         for round_idx in range(max_rounds):
             if has_integration_tools:
                 model_name = Config.OPENAI_MODEL
@@ -1289,58 +1488,46 @@ def get_openai_response(
                 max_tokens = int(getattr(Config, "VOICE_FAST_MAX_TOKENS", None) or 350)
                 timeout_s = float(getattr(Config, "VOICE_FAST_TIMEOUT_SECONDS", None) or 8)
 
-            response = openai_client.chat.completions.create(
+            content_text, tool_calls = _stream_chat_with_tools_to_ws(
+                openai_client,
+                ws,
                 model=model_name,
-                messages=msgs,
+                msgs=msgs,
                 temperature=temperature,
                 max_tokens=max_tokens,
                 timeout=timeout_s,
-                tools=tools_defs,
-                tool_choice="auto",
+                tools_defs=tools_defs,
+                wait_state=wait_state,
+                interrupt_state=interrupt_state,
             )
-            msg = response.choices[0].message
 
-            if not msg.tool_calls:
-                text = (msg.content or "").strip() or "Could you repeat that, please?"
-                _send_full_text(ws, text)
-                return text
+            if interrupt_state and interrupt_state.get("kind"):
+                return content_text or ""
 
-            # An integration tool will actually run → now (and only now) play the filler line.
-            integration_calls = [tc for tc in msg.tool_calls if tc.function.name != "end_call"]
-            if integration_calls and not wait_sent:
-                _ws_send_safe(
-                    ws,
-                    {
-                        "type": "text",
-                        "token": (Config.VOICE_WAIT_MESSAGE or "One moment while I check that.").strip(),
-                        "last": True,
-                        "interruptible": False,
-                        "preemptible": True,
-                    },
-                )
-                wait_sent = True
+            if not tool_calls:
+                return content_text
 
             assistant_payload = {
                 "role": "assistant",
-                "content": msg.content or "",
+                "content": content_text or "",
                 "tool_calls": [
                     {
-                        "id": tc.id,
+                        "id": tc["id"],
                         "type": "function",
                         "function": {
-                            "name": tc.function.name,
-                            "arguments": tc.function.arguments or "{}",
+                            "name": tc["name"],
+                            "arguments": tc["arguments"],
                         },
                     }
-                    for tc in msg.tool_calls
+                    for tc in tool_calls
                 ],
             }
             msgs.append(assistant_payload)
 
-            for tc in msg.tool_calls:
-                name = tc.function.name
+            for tc in tool_calls:
+                name = tc["name"]
                 try:
-                    args = json.loads(tc.function.arguments or "{}")
+                    args = json.loads(tc["arguments"] or "{}")
                 except json.JSONDecodeError:
                     args = {}
 
@@ -1385,7 +1572,7 @@ def get_openai_response(
                 else:
                     content = json.dumps({"error": "tool_unavailable"})
 
-                msgs.append({"role": "tool", "tool_call_id": tc.id, "content": content})
+                msgs.append({"role": "tool", "tool_call_id": tc["id"], "content": content})
 
         timeout_msg = "I could not finish that request in time. Please try again."
         _send_full_text(ws, timeout_msg)
