@@ -3,8 +3,37 @@ from openai import OpenAI as OpenAIClient
 from supabase import create_client
 from flask_sock import Sock
 from twilio.rest import Client as TwilioClient
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
 
 from config import Config
+
+
+# Shared rate limiter. Blueprints import this to decorate specific routes with
+# `@limiter.limit(...)`. No global default limits are set, so any route without
+# an explicit decorator (Twilio webhooks, the voice websocket, integrations,
+# etc.) stays completely unthrottled — only the endpoints we opt in are limited.
+limiter = Limiter(
+    key_func=get_remote_address,
+    storage_uri=Config.RATELIMIT_STORAGE_URI,
+    default_limits=[],
+    headers_enabled=True,
+    enabled=Config.RATELIMIT_ENABLED,
+)
+
+
+def init_rate_limiter(app):
+    limiter.init_app(app)
+
+    @app.errorhandler(429)
+    def _ratelimit_handler(e):
+        from flask import jsonify
+        return jsonify({
+            "error": "Too many requests. Please wait a moment and try again.",
+            "detail": getattr(e, "description", None),
+        }), 429
+
+    print("✅ Rate limiter initialized" if Config.RATELIMIT_ENABLED else "⚠️  Rate limiter disabled")
 
 
 def init_openai(app):
@@ -118,6 +147,7 @@ def register_blueprints(app):
 
 
 def init_app(app):
+    init_rate_limiter(app)
     init_openai(app)
     init_supabase(app)
     init_websocket(app)

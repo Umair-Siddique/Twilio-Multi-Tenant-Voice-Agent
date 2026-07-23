@@ -4,6 +4,7 @@ requests
 python-dotenv
 Flask
 flask_cors
+Flask-Limiter
 websockets
 flask-sock
 openai

@@ -1,15 +1,85 @@
 from flask import Blueprint, request, jsonify, current_app
 from urllib.parse import urlparse
 from config import Config
-from utils.auth_utils import require_role
+from utils.auth_utils import require_role, require_tenant
 
 
 twilio_bp = Blueprint('twilio', __name__)
 
 
+def _get_tenant_country(tenant_id, default="CA"):
+    """Return the ISO country code configured on the tenant's profile.
+
+    The phone-number search and purchase are locked to this value so a tenant
+    can only ever get a number in their own country, regardless of anything the
+    client sends.
+    """
+    supabase = getattr(current_app, "supabase_client", None)
+    if not supabase:
+        return default
+    try:
+        res = (
+            supabase.table("tenants")
+            .select("country")
+            .eq("id", tenant_id)
+            .limit(1)
+            .execute()
+        )
+        if res.data and res.data[0].get("country"):
+            return str(res.data[0]["country"]).strip().upper()[:2]
+    except Exception as e:
+        print(f"[WARN] Failed to read tenant country for {tenant_id}: {e}")
+    return default
+
+
+def _tenant_active_number_count(tenant_id):
+    """Count phone numbers already attached to a tenant (any status)."""
+    supabase = getattr(current_app, "supabase_client", None)
+    if not supabase:
+        return 0
+    try:
+        res = (
+            supabase.table("phone_numbers")
+            .select("id")
+            .eq("tenant_id", tenant_id)
+            .execute()
+        )
+        return len(res.data or [])
+    except Exception as e:
+        print(f"[WARN] Failed to count tenant numbers for {tenant_id}: {e}")
+        return 0
+
+
+@twilio_bp.route('/countries', methods=['GET'])
+def list_available_countries():
+    """
+    List the countries where this Twilio account can buy local numbers.
+    Public (no auth) so the signup form can populate its country dropdown.
+    Falls back to an empty list on any error; the frontend then uses its
+    built-in static list.
+    """
+    client = current_app.twilio_client
+    if not client:
+        return jsonify({"countries": []}), 200
+    try:
+        countries = client.available_phone_numbers.list()
+        data = [
+            {"code": c.country_code, "name": c.country}
+            for c in countries
+            if getattr(c, "country_code", None)
+        ]
+        data.sort(key=lambda x: x["name"] or x["code"])
+        return jsonify({"countries": data}), 200
+    except Exception as e:
+        print(f"[WARN] Failed to list Twilio available countries: {e}")
+        return jsonify({"countries": []}), 200
+
+
 @twilio_bp.route('/phone-numbers', methods=['GET'])
-def get_phone_numbers():
-    country = request.args.get("country", "CA")
+@require_tenant
+def get_phone_numbers(user_id, tenant_id, role):
+    # Country is locked to the tenant's profile — the client cannot override it.
+    country = _get_tenant_country(tenant_id)
     # How many items per page
     page_size = min(int(request.args.get("page_size", 20)), 100)
     # Cursor for next page (may be None/empty on first call)
@@ -55,6 +125,13 @@ def buy_phone_number(user_id, tenant_id, role):
     """
     data = request.get_json(silent=True) or {}
 
+    # Enforce a single phone number per tenant. If they already have one, block
+    # the purchase here (authoritative — the UI hides the buy flow too).
+    if _tenant_active_number_count(tenant_id) >= 1:
+        return jsonify({
+            "error": "Your account already has a phone number. Only one number is allowed per account."
+        }), 409
+
     def _resolve_call_agent_base_http_url():
         base = (Config.WEBSOCKET_BASE_URL or "").strip().rstrip("/")
         if base:
@@ -89,7 +166,8 @@ def buy_phone_number(user_id, tenant_id, role):
 
     phone_number = data.get("phone_number")
     area_code = data.get("area_code")
-    country = data.get("country", "CA")
+    # Country is locked to the tenant's profile, never trusted from the client.
+    country = _get_tenant_country(tenant_id)
 
     if phone_number:
         params["phone_number"] = phone_number

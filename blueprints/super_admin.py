@@ -42,6 +42,7 @@ import traceback
 
 from utils.auth_utils import verify_token
 from utils.supabase_retry import supabase_call_with_retry
+from config import Config
 
 super_admin_bp = Blueprint("super_admin", __name__)
 
@@ -156,6 +157,7 @@ def create_tenant(admin_user_id):
         "name": company_name,
         "timezone": data.get("timezone", "America/Toronto"),
         "industry": data.get("industry"),
+        "country": str(data.get("country") or "CA").strip().upper()[:2],
         "status": "active",
         "default_email_recipients": [owner_email],
     }
@@ -1530,6 +1532,169 @@ def remove_super_admin(admin_user_id, target_user_id):
         lambda: supabase.table("super_admins").delete().eq("user_id", target_user_id).execute()
     )
     return jsonify({"message": f"Super admin access revoked from '{existing.data[0]['email']}'"}), 200
+
+
+# ── Spam blocklist ────────────────────────────────────────────────────────────
+
+@super_admin_bp.route("/spam-numbers", methods=["GET"])
+@require_super_admin
+@handle_errors
+def list_spam_numbers(admin_user_id):
+    """Paginated list of platform-wide blocklisted numbers."""
+    supabase = current_app.supabase_client
+
+    page = max(1, int(request.args.get("page", 1)))
+    per_page = min(100, max(1, int(request.args.get("per_page", 20))))
+    offset = (page - 1) * per_page
+
+    resp = supabase_call_with_retry(
+        lambda: supabase.table("spam_numbers")
+        .select("*", count="exact")
+        .order("created_at", desc=True)
+        .range(offset, offset + per_page - 1)
+        .execute()
+    )
+    total = resp.count if resp.count is not None else len(resp.data or [])
+    return jsonify({
+        "spam_numbers": resp.data or [],
+        "pagination": {
+            "page": page,
+            "per_page": per_page,
+            "total": total,
+            "pages": -(-total // per_page) if per_page else 1,
+        },
+    }), 200
+
+
+@super_admin_bp.route("/spam-numbers", methods=["POST"])
+@require_super_admin
+@handle_errors
+def add_spam_number(admin_user_id):
+    """Add a phone number to the platform-wide blocklist."""
+    supabase = current_app.supabase_client
+    data = request.get_json(silent=True) or {}
+
+    phone = (data.get("phone_number") or "").strip()
+    if not phone:
+        return jsonify({"error": "phone_number is required"}), 400
+    reason = (data.get("reason") or "").strip() or None
+
+    existing = supabase_call_with_retry(
+        lambda: supabase.table("spam_numbers").select("id").eq("phone_number", phone).limit(1).execute()
+    )
+    if existing.data:
+        return jsonify({"error": "This number is already on the blocklist"}), 409
+
+    resp = supabase_call_with_retry(
+        lambda: supabase.table("spam_numbers").insert({
+            "phone_number": phone,
+            "reason": reason,
+            "added_by": admin_user_id,
+        }).execute()
+    )
+    if not resp.data:
+        return jsonify({"error": "Failed to add spam number"}), 500
+
+    return jsonify({
+        "message": f"'{phone}' added to the blocklist",
+        "spam_number": resp.data[0],
+    }), 201
+
+
+@super_admin_bp.route("/spam-numbers/<spam_id>", methods=["DELETE"])
+@require_super_admin
+@handle_errors
+def remove_spam_number(admin_user_id, spam_id):
+    """Remove a number from the platform-wide blocklist."""
+    supabase = current_app.supabase_client
+
+    existing = supabase_call_with_retry(
+        lambda: supabase.table("spam_numbers").select("phone_number").eq("id", spam_id).limit(1).execute()
+    )
+    if not existing.data:
+        return jsonify({"error": "Spam number not found"}), 404
+
+    supabase_call_with_retry(
+        lambda: supabase.table("spam_numbers").delete().eq("id", spam_id).execute()
+    )
+    return jsonify({
+        "message": f"'{existing.data[0]['phone_number']}' removed from the blocklist"
+    }), 200
+
+
+@super_admin_bp.route("/monitoring/spam", methods=["GET"])
+@require_super_admin
+@handle_errors
+def spam_monitoring(admin_user_id):
+    """
+    Platform-wide spam call monitoring over a time window.
+
+    Query params:
+        days           – window size (default 7, max 365)
+        min_spam_score – threshold to count a call as flagged
+        page/per_page  – pagination for the flagged-call list
+    """
+    supabase = current_app.supabase_client
+
+    try:
+        days = min(365, max(1, int(request.args.get("days", 7))))
+    except (ValueError, TypeError):
+        days = 7
+    try:
+        threshold = float(request.args.get("min_spam_score", Config.SPAM_SCORE_THRESHOLD))
+    except (ValueError, TypeError):
+        threshold = Config.SPAM_SCORE_THRESHOLD
+    page = max(1, int(request.args.get("page", 1)))
+    per_page = min(100, max(1, int(request.args.get("per_page", 20))))
+    offset = (page - 1) * per_page
+
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+
+    try:
+        resp = supabase_call_with_retry(
+            lambda: supabase.table("calls")
+            .select("id, tenant_id, call_sid, from_number, to_number, status, spam_score, spam_flags, created_at")
+            .gte("created_at", cutoff)
+            .execute()
+        )
+        rows = resp.data or []
+    except Exception as e:
+        # spam columns not migrated yet — return an empty (but valid) report.
+        print(f"[WARN] spam monitoring query failed: {e}")
+        rows = []
+
+    total_calls = len(rows)
+    flagged = [r for r in rows if float(r.get("spam_score") or 0) >= threshold]
+    flagged_count = len(flagged)
+
+    offenders = {}
+    for r in flagged:
+        num = r.get("from_number") or "unknown"
+        agg = offenders.setdefault(num, {"from_number": num, "flagged_calls": 0, "max_spam_score": 0})
+        agg["flagged_calls"] += 1
+        agg["max_spam_score"] = max(agg["max_spam_score"], float(r.get("spam_score") or 0))
+    top_offenders = sorted(offenders.values(), key=lambda x: x["flagged_calls"], reverse=True)[:10]
+
+    flagged_sorted = sorted(flagged, key=lambda r: r.get("created_at") or "", reverse=True)
+    page_slice = flagged_sorted[offset:offset + per_page]
+
+    return jsonify({
+        "window_days": days,
+        "spam_threshold": threshold,
+        "summary": {
+            "total_calls": total_calls,
+            "flagged_calls": flagged_count,
+            "flagged_rate": round(flagged_count / total_calls, 3) if total_calls else 0,
+        },
+        "top_offenders": top_offenders,
+        "flagged_calls": page_slice,
+        "pagination": {
+            "page": page,
+            "per_page": per_page,
+            "total": flagged_count,
+            "pages": -(-flagged_count // per_page) if per_page else 1,
+        },
+    }), 200
 
 
 # ── Health ────────────────────────────────────────────────────────────────────

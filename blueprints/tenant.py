@@ -6,7 +6,10 @@ from flask import Blueprint, request, jsonify, current_app, Response
 from utils.auth_utils import require_tenant, require_role
 from utils.supabase_retry import supabase_call_with_retry
 from utils.voice_catalog import AVAILABLE_VOICES, get_voice_by_id, get_default_voice, DEFAULT_VOICE_ID
+from config import Config
 from functools import wraps
+from datetime import datetime, timezone, timedelta
+from collections import defaultdict
 import traceback
 
 _VOICE_PREVIEW_TEXT = (
@@ -66,8 +69,12 @@ def update_tenant_profile(user_id, tenant_id, role):
     supabase = current_app.supabase_client
     
     # Allowed fields to update
-    allowed_fields = ['name', 'timezone', 'industry', 'default_email_recipients']
+    allowed_fields = ['name', 'timezone', 'industry', 'country', 'default_email_recipients']
     update_data = {k: v for k, v in data.items() if k in allowed_fields}
+
+    # Normalize country to an uppercase ISO 3166-1 alpha-2 code.
+    if 'country' in update_data and update_data['country']:
+        update_data['country'] = str(update_data['country']).strip().upper()[:2]
     
     if not update_data:
         return jsonify({"error": "No valid fields to update"}), 400
@@ -352,6 +359,119 @@ def set_voice_selection(user_id, tenant_id, role):
     return jsonify({
         "message": "Voice updated successfully",
         "voice": {k: voice[k] for k in _VOICE_PUBLIC_FIELDS},
+    }), 200
+
+
+@tenant_bp.route('/calls', methods=['GET'])
+@require_tenant
+@handle_errors
+def list_tenant_calls(user_id, tenant_id, role):
+    """
+    Paginated call history for the authenticated tenant.
+
+    Query params:
+        page          – 1-based page number (default 1)
+        per_page      – results per page (default 20, max 100)
+        status        – filter by call status
+        min_spam_score – only calls at/above this spam score
+    """
+    supabase = current_app.supabase_client
+
+    page = max(1, int(request.args.get("page", 1)))
+    per_page = min(100, max(1, int(request.args.get("per_page", 20))))
+    offset = (page - 1) * per_page
+    status = request.args.get("status")
+    min_spam = request.args.get("min_spam_score")
+
+    def _run(apply_spam_filter):
+        query = supabase.table("calls").select("*", count="exact").eq("tenant_id", tenant_id)
+        if status:
+            query = query.eq("status", status)
+        if apply_spam_filter and min_spam not in (None, ""):
+            query = query.gte("spam_score", float(min_spam))
+        return query.order("created_at", desc=True).range(offset, offset + per_page - 1).execute()
+
+    try:
+        resp = supabase_call_with_retry(lambda: _run(True))
+    except Exception as e:
+        # Degrade gracefully if the spam columns haven't been migrated yet.
+        print(f"[WARN] calls spam filter failed, retrying without it: {e}")
+        resp = supabase_call_with_retry(lambda: _run(False))
+
+    rows = resp.data or []
+    total = resp.count if resp.count is not None else len(rows)
+    return jsonify({
+        "calls": rows,
+        "pagination": {
+            "page": page,
+            "per_page": per_page,
+            "total": total,
+            "pages": -(-total // per_page) if per_page else 1,
+        },
+    }), 200
+
+
+@tenant_bp.route('/analytics', methods=['GET'])
+@require_tenant
+@handle_errors
+def tenant_analytics(user_id, tenant_id, role):
+    """
+    Aggregated call analytics for the authenticated tenant over a time window.
+
+    Query params:
+        days – window size in days (default 30, max 365)
+    """
+    supabase = current_app.supabase_client
+
+    try:
+        days = min(365, max(1, int(request.args.get("days", 30))))
+    except (ValueError, TypeError):
+        days = 30
+
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+
+    resp = supabase_call_with_retry(
+        lambda: supabase.table("calls")
+        .select("*")
+        .eq("tenant_id", tenant_id)
+        .gte("created_at", cutoff)
+        .execute()
+    )
+    rows = resp.data or []
+    total = len(rows)
+
+    completed = sum(1 for r in rows if r.get("status") == "completed")
+    failed = sum(1 for r in rows if r.get("status") in ("failed", "busy", "no-answer"))
+
+    durations = [int(r.get("duration_seconds") or 0) for r in rows]
+    avg_duration = round(sum(durations) / total, 1) if total else 0
+
+    volume = defaultdict(int)
+    for r in rows:
+        ts = r.get("created_at")
+        if ts:
+            volume[str(ts)[:10]] += 1
+    call_volume_by_day = [{"date": d, "count": c} for d, c in sorted(volume.items())]
+
+    interruptions_total = sum(int(r.get("interrupted_count") or 0) for r in rows)
+
+    threshold = Config.SPAM_SCORE_THRESHOLD
+    flagged = sum(1 for r in rows if float(r.get("spam_score") or 0) >= threshold)
+
+    return jsonify({
+        "window_days": days,
+        "calls": {"total": total, "completed": completed, "failed": failed},
+        "avg_duration_seconds": avg_duration,
+        "call_volume_by_day": call_volume_by_day,
+        "interruptions": {
+            "total": interruptions_total,
+            "rate_per_call": round(interruptions_total / total, 2) if total else 0,
+        },
+        "spam": {
+            "flagged": flagged,
+            "rate": round(flagged / total, 2) if total else 0,
+            "threshold": threshold,
+        },
     }), 200
 
 

@@ -23,6 +23,7 @@ CREATE TABLE tenants (
     name VARCHAR(255) NOT NULL,
     timezone VARCHAR(100) DEFAULT 'America/Toronto',
     industry VARCHAR(100),
+    country VARCHAR(2) DEFAULT 'CA', -- ISO 3166-1 alpha-2; locks phone-number search/purchase to this country
     status VARCHAR(50) DEFAULT 'active' CHECK (status IN ('active', 'inactive', 'suspended')),
     default_email_recipients TEXT[], -- Array of email addresses for call reports
     created_at TIMESTAMPTZ DEFAULT NOW(),
@@ -101,8 +102,20 @@ CREATE TABLE calls (
     end_time TIMESTAMPTZ,
     duration_seconds INTEGER,
     extracted_fields JSONB DEFAULT '{}', -- Caller info, intent, extracted data
+    spam_score NUMERIC DEFAULT 0,        -- 0..1 spam likelihood for the caller
+    spam_flags TEXT[] DEFAULT '{}',      -- reasons the call was flagged as spam
+    interrupted_count INTEGER DEFAULT 0, -- times the caller interrupted the agent
     created_at TIMESTAMPTZ DEFAULT NOW(),
     updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- 6b. SPAM NUMBERS TABLE (platform-wide blocklist, managed by super admins)
+CREATE TABLE spam_numbers (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    phone_number VARCHAR(20) NOT NULL UNIQUE, -- E.164 format
+    reason TEXT,
+    added_by UUID REFERENCES auth.users(id) ON DELETE SET NULL,
+    created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
 -- 7. CALL MESSAGES TABLE (Conversation Turns)
