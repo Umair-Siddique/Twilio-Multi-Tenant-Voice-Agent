@@ -90,3 +90,20 @@ class Config:
 
     # ── Voice agent concurrency ───────────────────────────────────────────────
     MAX_CONCURRENT_SESSIONS = int(os.getenv("MAX_CONCURRENT_SESSIONS", "100"))
+
+    # ── Rate limiting ─────────────────────────────────────────────────────────
+    # Storage backend for Flask-Limiter. Defaults to in-process memory (fine for
+    # a single worker). For multi-worker / multi-instance deployments set
+    # RATELIMIT_STORAGE_URI to a shared store, e.g. "redis://<host>:6379".
+    RATELIMIT_STORAGE_URI = os.getenv("RATELIMIT_STORAGE_URI", "memory://")
+    RATELIMIT_ENABLED = os.getenv("RATELIMIT_ENABLED", "true").lower() != "false"
+    # Per-endpoint limits (overridable via env without code changes).
+    RATELIMIT_SIGNIN = os.getenv("RATELIMIT_SIGNIN", "10 per minute")
+    RATELIMIT_SIGNUP = os.getenv("RATELIMIT_SIGNUP", "5 per minute")
+    RATELIMIT_FORGOT_PASSWORD = os.getenv("RATELIMIT_FORGOT_PASSWORD", "5 per minute")
+    RATELIMIT_RESET_PASSWORD = os.getenv("RATELIMIT_RESET_PASSWORD", "10 per minute")
+    RATELIMIT_REFRESH = os.getenv("RATELIMIT_REFRESH", "30 per minute")
+
+    # ── Spam scoring ──────────────────────────────────────────────────────────
+    # A call whose spam_score is >= this threshold is counted as "flagged".
+    SPAM_SCORE_THRESHOLD = float(os.getenv("SPAM_SCORE_THRESHOLD", "0.7"))

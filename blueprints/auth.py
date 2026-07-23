@@ -7,6 +7,7 @@ from datetime import datetime, timedelta
 from email.message import EmailMessage
 
 from config import Config
+from extensions import limiter
 
 auth_bp = Blueprint('auth', __name__)
 
@@ -117,6 +118,7 @@ def _send_reset_email_via_smtp(email_to, reset_link):
 
 
 @auth_bp.route('/signup', methods=['POST'])
+@limiter.limit(lambda: Config.RATELIMIT_SIGNUP)
 @handle_errors
 def signup():
     """
@@ -226,10 +228,11 @@ def signup():
                 "name": data['company_name'],
                 "timezone": data.get('timezone', 'America/Toronto'),
                 "industry": data.get('industry'),
+                "country": str(data.get('country') or 'CA').strip().upper()[:2],
                 "status": "active",
                 "default_email_recipients": data.get('default_email_recipients', [data['email']])
             }
-            
+
             tenant_response = supabase.table('tenants').insert(tenant_data).execute()
             
             if not tenant_response.data or len(tenant_response.data) == 0:
@@ -250,7 +253,15 @@ def signup():
                 "solution": "1. Run fix_rls_service_role.sql in Supabase SQL Editor\n2. Verify SUPABASE_SECRET_KEY is the service_role key (not anon key)\n3. Service role key should start with 'eyJ...' and be much longer than anon key"
             }), 500
         return jsonify({"error": f"Failed to create tenant: {error_msg}"}), 500
-    
+
+    # Persist country regardless of which creation path ran. The create_tenant
+    # RPC doesn't take a country argument, so set it explicitly here.
+    try:
+        country = str(data.get('country') or 'CA').strip().upper()[:2]
+        supabase.table('tenants').update({"country": country}).eq('id', tenant_id).execute()
+    except Exception as country_error:
+        print(f"Warning: Failed to set tenant country: {str(country_error)}")
+
     # Step 3: Create tenant_user linking user to tenant
     try:
         tenant_user_data = {
@@ -306,6 +317,7 @@ def signup():
 
 
 @auth_bp.route('/signin', methods=['POST'])
+@limiter.limit(lambda: Config.RATELIMIT_SIGNIN)
 @handle_errors
 def signin():
     """
@@ -421,6 +433,7 @@ def signout():
 
 
 @auth_bp.route('/refresh', methods=['POST'])
+@limiter.limit(lambda: Config.RATELIMIT_REFRESH)
 @handle_errors
 def refresh_token():
     """
@@ -461,6 +474,7 @@ def refresh_token():
 
 
 @auth_bp.route('/forgot-password', methods=['POST'])
+@limiter.limit(lambda: Config.RATELIMIT_FORGOT_PASSWORD)
 @handle_errors
 def forgot_password():
     """
@@ -557,6 +571,7 @@ def _cleanup_expired_tokens(supabase):
 
 
 @auth_bp.route('/reset-password', methods=['POST'])
+@limiter.limit(lambda: Config.RATELIMIT_RESET_PASSWORD)
 @handle_errors
 def reset_password():
     """
