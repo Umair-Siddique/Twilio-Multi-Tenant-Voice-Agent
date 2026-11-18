@@ -133,6 +133,7 @@ def register_blueprints(app):
     from blueprints.integrations_google_calendar import google_calendar_integration_bp
     from blueprints.integrations_hubspot import hubspot_integration_bp
     from blueprints.super_admin import super_admin_bp
+    from blueprints.campaigns import campaigns_bp, admin_campaigns_bp
 
     app.register_blueprint(auth_bp, url_prefix="/auth")
     app.register_blueprint(tenant_bp, url_prefix="/tenant")
@@ -141,9 +142,23 @@ def register_blueprints(app):
     app.register_blueprint(google_calendar_integration_bp, url_prefix="/integrations/google-calendar")
     app.register_blueprint(hubspot_integration_bp, url_prefix="/integrations/hubspot")
     app.register_blueprint(super_admin_bp, url_prefix="/admin")
+    app.register_blueprint(campaigns_bp, url_prefix="/campaigns")
+    app.register_blueprint(admin_campaigns_bp, url_prefix="/admin/campaigns")
 
     register_websocket(app)
     print("✅ Blueprints registered")
+
+
+def init_campaign_dispatcher(app):
+    from utils.campaign_dispatcher import ensure_dispatcher_running
+
+    ensure_dispatcher_running(app)
+
+    # Cheap per-request check so a worker forked after app creation (e.g.
+    # gunicorn --preload) still gets its own dispatcher thread.
+    @app.before_request
+    def _ensure_campaign_dispatcher():
+        ensure_dispatcher_running(app)
 
 
 def init_app(app):
@@ -153,3 +168,4 @@ def init_app(app):
     init_websocket(app)
     init_twilio(app)
     register_blueprints(app)
+    init_campaign_dispatcher(app)

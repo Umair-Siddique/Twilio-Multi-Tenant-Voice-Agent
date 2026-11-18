@@ -6,6 +6,13 @@ from flask import Blueprint, request, jsonify, current_app, Response
 from utils.auth_utils import require_tenant, require_role
 from utils.supabase_retry import supabase_call_with_retry
 from utils.voice_catalog import AVAILABLE_VOICES, get_voice_by_id, get_default_voice, DEFAULT_VOICE_ID
+from utils.address_verification import (
+    address_columns,
+    has_address_input,
+    normalize_country,
+    region_lock_error,
+    verify_address,
+)
 from config import Config
 from functools import wraps
 from datetime import datetime, timezone, timedelta
@@ -67,18 +74,58 @@ def update_tenant_profile(user_id, tenant_id, role):
     """
     data = request.get_json()
     supabase = current_app.supabase_client
-    
+
     # Allowed fields to update
     allowed_fields = ['name', 'timezone', 'industry', 'country', 'default_email_recipients']
     update_data = {k: v for k, v in data.items() if k in allowed_fields}
 
     # Normalize country to an uppercase ISO 3166-1 alpha-2 code.
     if 'country' in update_data and update_data['country']:
-        update_data['country'] = str(update_data['country']).strip().upper()[:2]
-    
+        update_data['country'] = normalize_country(update_data['country'])
+
+    # Any change to the address (or the country it sits in) must be re-verified
+    # before it is stored — an account can't edit its way to an unverified
+    # address or out of the supported region.
+    address_changed = has_address_input(data) or 'country' in update_data
+
+    if address_changed:
+        current = supabase_call_with_retry(
+            lambda: supabase.table("tenants")
+            .select("address_line1, address_line2, city, state, postal_code, country")
+            .eq("id", tenant_id)
+            .limit(1)
+            .execute()
+        )
+        existing = (current.data or [{}])[0]
+
+        country = normalize_country(update_data.get('country') or existing.get('country'))
+        region_error = region_lock_error(country)
+        if region_error:
+            body, status = region_error
+            return jsonify(body), status
+
+        # Fall back to the stored value for any address field not being changed,
+        # so a partial edit is still verified as a complete address.
+        address_input = {
+            field: (
+                data[field] if field in data else existing.get(field)
+            )
+            for field in ('address_line1', 'address_line2', 'city', 'state', 'postal_code')
+        }
+
+        verification = verify_address(address_input, country)
+        if verification["status"] == "rejected":
+            return jsonify({
+                "error": "Address verification failed",
+                "message": verification["message"],
+                "field": "address",
+            }), 503 if verification.get("unavailable") else 400
+
+        update_data.update(address_columns(verification, address_input, country))
+
     if not update_data:
         return jsonify({"error": "No valid fields to update"}), 400
-    
+
     # Update tenant
     response = supabase_call_with_retry(
         lambda: supabase.table("tenants").update(update_data).eq("id", tenant_id).execute()

@@ -88,6 +88,30 @@ class Config:
     # ── Credential encryption ─────────────────────────────────────────────────
     CREDENTIAL_ENCRYPTION_KEY = os.getenv("CREDENTIAL_ENCRYPTION_KEY")
 
+    # ── Address verification / region lock ────────────────────────────────────
+    # Business addresses are validated with the Google Address Validation API.
+    # Enable the "Address Validation API" on a Google Cloud project with billing
+    # enabled, then create a server-side API key restricted to that one API.
+    GOOGLE_ADDRESS_VALIDATION_API_KEY = os.getenv("GOOGLE_ADDRESS_VALIDATION_API_KEY")
+    ADDRESS_VERIFICATION_ENABLED = (
+        os.getenv("ADDRESS_VERIFICATION_ENABLED", "true").lower() != "false"
+    )
+    # Strict (default): if the verification API is unreachable or unconfigured,
+    # signup is blocked rather than letting an unverified address through.
+    # Set to "false" to let those accounts through flagged as "unverified".
+    ADDRESS_VERIFICATION_STRICT = (
+        os.getenv("ADDRESS_VERIFICATION_STRICT", "true").lower() != "false"
+    )
+    ADDRESS_VERIFICATION_TIMEOUT_SECONDS = float(
+        os.getenv("ADDRESS_VERIFICATION_TIMEOUT_SECONDS", "10")
+    )
+    # USPS CASS certification — US/Puerto Rico only, off by default. When on,
+    # US addresses are checked for real USPS deliverability, not just a postal
+    # match. Note Google's CASS terms require reporting artificial addresses.
+    ADDRESS_ENABLE_USPS_CASS = (
+        os.getenv("ADDRESS_ENABLE_USPS_CASS", "false").lower() == "true"
+    )
+
     # ── Voice agent concurrency ───────────────────────────────────────────────
     MAX_CONCURRENT_SESSIONS = int(os.getenv("MAX_CONCURRENT_SESSIONS", "100"))
 
@@ -107,3 +131,49 @@ class Config:
     # ── Spam scoring ──────────────────────────────────────────────────────────
     # A call whose spam_score is >= this threshold is counted as "flagged".
     SPAM_SCORE_THRESHOLD = float(os.getenv("SPAM_SCORE_THRESHOLD", "0.7"))
+
+    # ── Broadcast campaigns (outbound recorded-message calls + emails) ────────
+    # The dispatcher is a background thread that dials/emails contacts of
+    # running campaigns. Safe with several workers: each campaign is leased to
+    # one dispatcher at a time. Set to "false" on the web service if you run
+    # `python campaign_worker.py` as a separate worker process instead.
+    CAMPAIGN_DISPATCHER_ENABLED = (
+        os.getenv("CAMPAIGN_DISPATCHER_ENABLED", "true").lower() != "false"
+    )
+    CAMPAIGN_DISPATCH_INTERVAL_SECONDS = float(os.getenv("CAMPAIGN_DISPATCH_INTERVAL_SECONDS", "5"))
+    # Twilio's default outbound limit is 1 call per second per account; raise
+    # this only after Twilio has raised the account's CPS.
+    CAMPAIGN_CALLS_PER_SECOND = float(os.getenv("CAMPAIGN_CALLS_PER_SECOND", "1"))
+    # Upper bound for a campaign's max_concurrent_calls setting.
+    CAMPAIGN_MAX_CONCURRENT_CALLS_LIMIT = int(os.getenv("CAMPAIGN_MAX_CONCURRENT_CALLS_LIMIT", "20"))
+    CAMPAIGN_EMAILS_PER_MINUTE = float(os.getenv("CAMPAIGN_EMAILS_PER_MINUTE", "20"))
+    # Calls with no status update for this long are reconciled against Twilio.
+    CAMPAIGN_STALE_CALL_MINUTES = int(os.getenv("CAMPAIGN_STALE_CALL_MINUTES", "15"))
+    # Public base URL Twilio calls back on (e.g. "https://api.example.com").
+    # When unset it is derived from the request host / VOICE_WEBHOOK_URL.
+    CAMPAIGN_WEBHOOK_BASE_URL = os.getenv("CAMPAIGN_WEBHOOK_BASE_URL")
+    # Campaigns are the platform's own marketing outreach, run by super admins.
+    # Caller ID default; any voice number on the Twilio account may be picked.
+    CAMPAIGN_DEFAULT_FROM_NUMBER = os.getenv("CAMPAIGN_DEFAULT_FROM_NUMBER", "+12044004668")
+    # Region for sheet numbers written without a +country code, and the
+    # timezone a new campaign's calling hours default to.
+    CAMPAIGN_DEFAULT_COUNTRY = os.getenv("CAMPAIGN_DEFAULT_COUNTRY", "CA")
+    CAMPAIGN_DEFAULT_TIMEZONE = os.getenv("CAMPAIGN_DEFAULT_TIMEZONE", "America/Winnipeg")
+    # Sender identity in campaign email footers. Anti-spam laws (CASL, CAN-SPAM)
+    # require a physical mailing address in commercial email — set it.
+    CAMPAIGN_SENDER_NAME = os.getenv("CAMPAIGN_SENDER_NAME", "Aidan Pro")
+    CAMPAIGN_SENDER_ADDRESS = os.getenv("CAMPAIGN_SENDER_ADDRESS")
+    CAMPAIGN_AUDIO_BUCKET = os.getenv("CAMPAIGN_AUDIO_BUCKET", "campaign-audio")
+    CAMPAIGN_AUDIO_MAX_BYTES = int(os.getenv("CAMPAIGN_AUDIO_MAX_BYTES", str(10 * 1024 * 1024)))
+    CAMPAIGN_IMPORT_MAX_BYTES = int(os.getenv("CAMPAIGN_IMPORT_MAX_BYTES", str(10 * 1024 * 1024)))
+    CAMPAIGN_IMPORT_MAX_ROWS = int(os.getenv("CAMPAIGN_IMPORT_MAX_ROWS", "50000"))
+    # Campaign emails can use a dedicated sender (recommended for bulk mail —
+    # a Gmail account caps out at roughly 500 messages/day). Each setting falls
+    # back to the regular SMTP settings above.
+    CAMPAIGN_SMTP_HOST = os.getenv("CAMPAIGN_SMTP_HOST") or SMTP_HOST
+    CAMPAIGN_SMTP_PORT = int(os.getenv("CAMPAIGN_SMTP_PORT") or SMTP_PORT)
+    CAMPAIGN_SMTP_USER = os.getenv("CAMPAIGN_SMTP_USER") or ADMIN_EMAIL
+    CAMPAIGN_SMTP_PASSWORD = os.getenv("CAMPAIGN_SMTP_PASSWORD") or ADMIN_APP_PASSWORD
+    CAMPAIGN_SMTP_FROM_EMAIL = (
+        os.getenv("CAMPAIGN_SMTP_FROM_EMAIL") or SMTP_FROM_EMAIL or CAMPAIGN_SMTP_USER
+    )

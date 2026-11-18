@@ -8,6 +8,13 @@ from email.message import EmailMessage
 
 from config import Config
 from extensions import limiter
+from utils.address_verification import (
+    address_columns,
+    normalize_country,
+    region_lock_error,
+    supported_countries,
+    verify_address,
+)
 
 auth_bp = Blueprint('auth', __name__)
 
@@ -147,12 +154,39 @@ def signup():
     
     if not data.get('company_name'):
         return jsonify({"error": "Company name is required"}), 400
-    
+
     supabase = current_app.supabase_client
-    
+
     if not supabase:
         return jsonify({"error": "Supabase not configured"}), 500
-    
+
+    # Step 0: Region lock + business address verification.
+    # Runs before any account is created so a rejected address never leaves an
+    # orphaned Supabase Auth user behind.
+    country = normalize_country(data.get('country'))
+    region_error = region_lock_error(country)
+    if region_error:
+        body, status = region_error
+        return jsonify(body), status
+
+    address_input = {
+        "address_line1": data.get('address_line1'),
+        "address_line2": data.get('address_line2'),
+        "city": data.get('city'),
+        "state": data.get('state'),
+        "postal_code": data.get('postal_code'),
+    }
+
+    verification = verify_address(address_input, country)
+    if verification["status"] == "rejected":
+        return jsonify({
+            "error": "Address verification failed",
+            "message": verification["message"],
+            "field": "address",
+        }), 503 if verification.get("unavailable") else 400
+
+    address_fields = address_columns(verification, address_input, country)
+
     # Step 1: Create user in Supabase Auth
     try:
         auth_response = supabase.auth.sign_up({
@@ -228,9 +262,9 @@ def signup():
                 "name": data['company_name'],
                 "timezone": data.get('timezone', 'America/Toronto'),
                 "industry": data.get('industry'),
-                "country": str(data.get('country') or 'CA').strip().upper()[:2],
                 "status": "active",
-                "default_email_recipients": data.get('default_email_recipients', [data['email']])
+                "default_email_recipients": data.get('default_email_recipients', [data['email']]),
+                **address_fields,
             }
 
             tenant_response = supabase.table('tenants').insert(tenant_data).execute()
@@ -254,13 +288,12 @@ def signup():
             }), 500
         return jsonify({"error": f"Failed to create tenant: {error_msg}"}), 500
 
-    # Persist country regardless of which creation path ran. The create_tenant
-    # RPC doesn't take a country argument, so set it explicitly here.
+    # Persist country + verified address regardless of which creation path ran.
+    # The create_tenant RPC doesn't take these arguments, so set them here.
     try:
-        country = str(data.get('country') or 'CA').strip().upper()[:2]
-        supabase.table('tenants').update({"country": country}).eq('id', tenant_id).execute()
-    except Exception as country_error:
-        print(f"Warning: Failed to set tenant country: {str(country_error)}")
+        supabase.table('tenants').update(address_fields).eq('id', tenant_id).execute()
+    except Exception as address_error:
+        print(f"Warning: Failed to set tenant address: {str(address_error)}")
 
     # Step 3: Create tenant_user linking user to tenant
     try:
@@ -818,6 +851,18 @@ def get_current_user():
         
     except Exception as e:
         return jsonify({"error": f"Failed to get user info: {str(e)}"}), 401
+
+
+@auth_bp.route('/supported-countries', methods=['GET'])
+def get_supported_countries():
+    """
+    List the countries where an account can be opened.
+
+    Public (no auth) so the signup form can populate its country dropdown and
+    never offer a country the backend would reject. Accounts are limited to
+    North America and Europe, where a business address can be verified.
+    """
+    return jsonify({"countries": supported_countries()}), 200
 
 
 @auth_bp.route('/health', methods=['GET'])

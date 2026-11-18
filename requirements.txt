@@ -16,3 +16,5 @@ google-auth-oauthlib
 hubspot-api-client
 cryptography
 flask_sock
+openpyxl
+phonenumbers

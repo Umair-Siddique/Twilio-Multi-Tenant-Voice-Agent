@@ -24,6 +24,18 @@ CREATE TABLE tenants (
     timezone VARCHAR(100) DEFAULT 'America/Toronto',
     industry VARCHAR(100),
     country VARCHAR(2) DEFAULT 'CA', -- ISO 3166-1 alpha-2; locks phone-number search/purchase to this country
+    -- Business address. Stored in Google's normalized form once verified.
+    -- Accounts are region-locked to North America / Europe; see
+    -- utils/address_verification.py for the country allowlist.
+    address_line1 TEXT,
+    address_line2 TEXT,
+    city TEXT,
+    state TEXT,
+    postal_code TEXT,
+    address_formatted TEXT, -- Google's normalized single-line address
+    address_verified BOOLEAN DEFAULT FALSE,
+    address_verification_status VARCHAR(20), -- verified | unverified | skipped
+    address_verified_at TIMESTAMPTZ,
     status VARCHAR(50) DEFAULT 'active' CHECK (status IN ('active', 'inactive', 'suspended')),
     default_email_recipients TEXT[], -- Array of email addresses for call reports
     created_at TIMESTAMPTZ DEFAULT NOW(),
@@ -516,6 +528,15 @@ CREATE TRIGGER update_integration_credentials_updated_at BEFORE UPDATE ON integr
 
 CREATE TRIGGER update_booking_requests_updated_at BEFORE UPDATE ON booking_requests
     FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+
+-- =====================================================
+-- PHASE 7: BROADCAST CAMPAIGNS
+-- =====================================================
+-- Platform-level (super-admin) marketing call campaigns: tables campaigns,
+-- campaign_contacts, campaign_suppressions, their stats functions and the
+-- campaign-audio storage bucket live in
+-- migrations/2026_11_03_add_broadcast_campaigns.sql — run it after this file.
 
 
 -- =====================================================

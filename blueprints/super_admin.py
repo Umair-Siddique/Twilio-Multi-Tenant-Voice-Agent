@@ -42,6 +42,13 @@ import traceback
 
 from utils.auth_utils import verify_token
 from utils.supabase_retry import supabase_call_with_retry
+from utils.address_verification import (
+    address_columns,
+    has_address_input,
+    normalize_country,
+    region_lock_error,
+    verify_address,
+)
 from config import Config
 
 super_admin_bp = Blueprint("super_admin", __name__)
@@ -134,6 +141,32 @@ def create_tenant(admin_user_id):
     if not owner_password or len(owner_password) < 6:
         return jsonify({"error": "owner_password must be at least 6 characters"}), 400
 
+    # Region lock applies to admin-created tenants too. The address itself is
+    # optional here (an operator may be onboarding a tenant before collecting
+    # it) but is verified whenever one is supplied. Checked before the auth
+    # user is created so a rejection leaves nothing behind.
+    country = normalize_country(data.get("country"))
+    region_error = region_lock_error(country)
+    if region_error:
+        body, status = region_error
+        return jsonify(body), status
+
+    address_fields = {"country": country}
+    if has_address_input(data):
+        address_input = {
+            field: data.get(field)
+            for field in ('address_line1', 'address_line2', 'city', 'state', 'postal_code')
+        }
+        verification = verify_address(address_input, country)
+        if verification["status"] == "rejected":
+            return jsonify({
+                "error": "Address verification failed",
+                "message": verification["message"],
+                "field": "address",
+            }), 503 if verification.get("unavailable") else 400
+
+        address_fields.update(address_columns(verification, address_input, country))
+
     supabase = current_app.supabase_client
 
     # 1. Create auth user
@@ -157,9 +190,9 @@ def create_tenant(admin_user_id):
         "name": company_name,
         "timezone": data.get("timezone", "America/Toronto"),
         "industry": data.get("industry"),
-        "country": str(data.get("country") or "CA").strip().upper()[:2],
         "status": "active",
         "default_email_recipients": [owner_email],
+        **address_fields,
     }
     tenant_resp = supabase_call_with_retry(
         lambda: supabase.table("tenants").insert(tenant_data).execute()
